@@ -1,0 +1,17 @@
+[project]
+name = "microimage"
+version = "0.1.0"
+description = "Management of microscopy image analysis project"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "nd2",
+    "pylibczirw",
+    "tifffile",
+    "ome-types",
+    "xarray",
+    "ipykernel>=7.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
