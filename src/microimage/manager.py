@@ -9,7 +9,19 @@ from itertools import chain
 
 # Custom connection factory to return dictionary rows instead of tuples
 def dict_factory(cursor, row):
-    """Converts SQLite tuple row results into a dictionary."""
+    """Converts SQLite tuple row results into a dictionary.
+
+    This function is used as a `row_factory` for an sqlite3 connection
+    to make query results more intuitive to access by column name.
+
+    Parameters
+    ----------
+    cursor : sqlite3.Cursor
+        The cursor object from which the row was fetched.
+    row : tuple
+        The raw tuple row fetched from the database.
+
+    """
     d = {}
     for idx, col in enumerate(cursor.description):
         d[col[0]] = row[idx]
@@ -24,11 +36,36 @@ MultiFileParser = Callable[[Path], List[Dict[str, Any]]]
 @dataclass
 class DataItem:
     """
-    Represents a single item (image) in your dataset.
+    Represents a single processable item, such as an image or a scene.
 
-    relative_image_path now refers to the container file, and is stored
-    relative to the ExperimentManager's data_dir.
-    internal_index identifies the specific image within that container file.
+    This dataclass holds all information related to a single item, including its
+    source file, metadata, processing status, and any generated results. It is
+    designed to be a self-contained unit that can be serialized to and from
+    the database.
+
+    Parameters
+    ----------
+    relative_image_path : Path
+        The path to the container file, relative to the `ExperimentManager`'s
+        `data_dir`.
+    internal_index : str, optional
+        A unique identifier for the item within its container file (e.g., a
+        scene number or series index). Defaults to "".
+
+    Attributes
+    ----------
+    metadata : Dict[str, Any]
+        A dictionary for storing arbitrary metadata about the item.
+    result_files : Dict[str, str]
+        A dictionary mapping a result type (str) to its relative path (str).
+    processed : bool
+        A flag indicating whether the item has been successfully processed.
+    error : Optional[str]
+        A string containing an error message if processing failed.
+    id : str
+        The unique identifier for the item, derived from the container name
+        and internal index (e.g., "image.czi:0").
+
     """
 
     # Required field, points to the container file
@@ -59,30 +96,67 @@ class DataItem:
             self.id = container_name
 
     def add_metadata(self, metadata_dict: Dict[str, Any]):
-        """Adds or updates key-value pairs in the metadata."""
+        """Add or update key-value pairs in the item's metadata.
+
+        Parameters
+        ----------
+        metadata_dict : Dict[str, Any]
+            A dictionary of metadata to merge into the existing metadata.
+
+        """
         self.metadata.update(metadata_dict)
 
     def add_result_file(self, result_type: str, relative_file_path: str):
-        """
-        Registers a new result file for this item, categorized by type.
+        """Register a new result file for this item.
+
+        Parameters
+        ----------
+        result_type : str
+            A string identifying the type of result (e.g., "thumbnail", "mask").
+        relative_file_path : str
+            The path to the result file, relative to the project root.
+
         """
         self.result_files[result_type] = relative_file_path
 
     def get_absolute_container_path(self, base_data_dir: Path) -> Path:
-        """
-        Returns the full, absolute path to the container file, resolving relative_image_path
-        against the provided base_data_dir (which should be the ExperimentManager's data_dir).
+        """Return the absolute path to the item's container file.
+
+        Parameters
+        ----------
+        base_data_dir : Path
+            The absolute path to the main data directory, which serves as the
+            base for the item's `relative_image_path`.
+
+        Returns
+        -------
+        Path
+            The resolved, absolute path to the container file.
+
         """
         return (base_data_dir / self.relative_image_path).resolve()
 
     def get_full_id(self) -> str:
-        """Returns the unique ID for this DataItem."""
+        """Return the unique ID for this DataItem.
+
+        Returns
+        -------
+        str
+            The unique identifier string.
+        """
         return self.id
 
     def to_db_row(self) -> Dict[str, Any]:
         """
         Converts the DataItem object into a dictionary suitable for DB insertion/update
         for the 'items' table (excluding result_files).
+        """
+        """Convert the DataItem to a dictionary for database storage.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary representation of the item for the 'items' table.
         """
         return {
             "id": self.id,
@@ -97,9 +171,20 @@ class DataItem:
     def from_db_row(
         cls, data: Dict[str, Any], result_files: Optional[Dict[str, str]] = None
     ) -> "DataItem":
-        """
-        Creates a DataItem object from a database row dictionary, optionally
-        including result files fetched from the separate table.
+        """Create a DataItem instance from a database row.
+
+        Parameters
+        ----------
+        data : Dict[str, Any]
+            A dictionary representing a row from the 'items' table.
+        result_files : Optional[Dict[str, str]], optional
+            A dictionary of result files for this item, by default None.
+
+        Returns
+        -------
+        DataItem
+            A fully hydrated DataItem instance.
+
         """
         relative_path_str = data.get("relative_image_path")
         if relative_path_str is None:
@@ -124,9 +209,32 @@ class DataItem:
 
 class ExperimentManager:
     """
-    Manages the entire collection of DataItems using an SQLite database
+    Manages a collection of DataItems using a persistent SQLite database.
 
-    We want to store in it some extra metadata on the dataset collection.
+    This class is the main entry point for interacting with a dataset. It handles
+    directory scanning, database initialization, and the creation, retrieval,
+    and updating of `DataItem` objects. It acts as a container, allowing
+    dictionary-style access and iteration over the items.
+
+    Parameters
+    ----------
+    data_dir : Union[str, Path]
+        The path to the directory containing the raw data files. This directory
+        must exist and be readable.
+    results_dir : Union[str, Path]
+        The path to the directory where output files will be saved. It will be
+        created if it doesn't exist and must be writable.
+    db_path : Union[str, Path], optional
+        The path to the SQLite database file. Defaults to "experiment.db" in
+        the current working directory.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the `data_dir` does not exist.
+    PermissionError
+        If the `data_dir` is not readable or `results_dir` is not writable.
+
     """
 
     def __init__(
@@ -170,7 +278,14 @@ class ExperimentManager:
         self._initialize_db()
 
     def _get_connection(self):
-        """Returns a new database connection."""
+        """Return a new database connection with a dict row factory.
+
+        Returns
+        -------
+        sqlite3.Connection
+            A new connection to the SQLite database.
+
+        """
         conn = sqlite3.connect(
             self.db_path, timeout=10.0
         )  # Set a high timeout for concurrency
@@ -178,10 +293,7 @@ class ExperimentManager:
         return conn
 
     def _initialize_db(self):
-        """
-        Creates the necessary tables if they don't exist.
-        The 'items' table now includes 'internal_index'.
-        """
+        """Create the database tables if they do not already exist."""
         print(f"Initializing database at {self.db_path}...")
         conn = self._get_connection()
         try:
@@ -217,7 +329,20 @@ class ExperimentManager:
     def _fetch_result_files(
         self, conn: sqlite3.Connection, item_id: str
     ) -> Dict[str, str]:
-        """Helper to fetch result files for a single item from the dedicated table."""
+        """Fetch all result files for a given item ID.
+
+        Parameters
+        ----------
+        conn : sqlite3.Connection
+            An active database connection.
+        item_id : str
+            The unique ID of the item.
+
+        Returns
+        -------
+        Dict[str, str]
+            A dictionary mapping result type to relative file path.
+        """
         cursor = conn.execute(
             "SELECT result_type, relative_file_path FROM result_files WHERE item_id = ?",
             (item_id,),
@@ -230,7 +355,20 @@ class ExperimentManager:
     def _fetch_item_with_results(
         self, conn: sqlite3.Connection, item_id: str
     ) -> Optional["DataItem"]:
-        """Helper to fetch an item and its associated results, returning a DataItem."""
+        """Fetch a single item and its results from the database.
+
+        Parameters
+        ----------
+        conn : sqlite3.Connection
+            An active database connection.
+        item_id : str
+            The unique ID of the item to fetch.
+
+        Returns
+        -------
+        Optional[DataItem]
+            A `DataItem` instance if found, otherwise None.
+        """
         cursor = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,))
         item_row = cursor.fetchone()
 
@@ -244,8 +382,22 @@ class ExperimentManager:
     # --- Python Container Protocol Methods ---
 
     def __getitem__(self, item_id: str) -> "DataItem":
-        """
-        Retrieves a single DataItem by its ID (filename:index) from the database.
+        """Retrieve a single DataItem by its unique ID.
+
+        Parameters
+        ----------
+        item_id : str
+            The unique ID of the item (e.g., "image.czi:0").
+
+        Returns
+        -------
+        DataItem
+            The requested DataItem instance.
+
+        Raises
+        ------
+        KeyError
+            If no item with the given ID is found.
         """
         conn = self._get_connection()
         try:
@@ -260,7 +412,14 @@ class ExperimentManager:
             conn.close()
 
     def __len__(self) -> int:
-        """Returns the total number of items in the dataset, enabling len(manager)."""
+        """Return the total number of items in the database.
+
+        Returns
+        -------
+        int
+            The total count of items.
+
+        """
         conn = self._get_connection()
         try:
             count = conn.execute("SELECT COUNT(id) FROM items").fetchone()["COUNT(id)"]
@@ -272,8 +431,13 @@ class ExperimentManager:
             conn.close()
 
     def __iter__(self) -> Iterator["DataItem"]:
-        """
-        Returns an iterator over all DataItem objects in the database, enabling 'for item in manager:'.
+        """Return an iterator over all DataItem objects in the database.
+
+        Yields
+        ------
+        Iterator[DataItem]
+            An iterator that yields each `DataItem` in the collection.
+
         """
         return iter(self.get_all_items())
 
@@ -284,10 +448,21 @@ class ExperimentManager:
         extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"],
         multi_file_parser: MultiFileParser = None,
     ):
-        """
-        Scans the data directory for new files. If multi_file_parser is provided,
-        it handles all file types and returns one or more items per file.
-        If not provided, every file is treated as a single DataItem.
+        """Scan the data directory for new files and register them.
+
+        This method walks through the `data_dir`, identifies files with the
+        specified extensions, and adds them to the database if they are not
+        already present.
+
+        Parameters
+        ----------
+        extensions : List[str], optional
+            A list of file extensions to look for, by default [".png", ".jpg", ".jpeg", ".tif"].
+        multi_file_parser : MultiFileParser, optional
+            A callable that takes a file `Path` and returns a list of dicts,
+            one for each sub-item (e.g., scene) in the file. If not provided,
+            each file is treated as a single item.
+
         """
         print(f"Scanning {self.data_dir} for new files...")
         conn = self._get_connection()
@@ -373,9 +548,17 @@ class ExperimentManager:
             conn.close()
 
     def update_item(self, item: DataItem):
-        """
-        Updates the status of a single item in the database, including
-        synchronizing its associated result files.
+        """Update an item's record in the database.
+
+        This method synchronizes the state of a `DataItem` object with the
+        database, updating its metadata, processed status, error message,
+        and associated result files.
+
+        Parameters
+        ----------
+        item : DataItem
+            The `DataItem` object to update in the database.
+
         """
         conn = self._get_connection()
         try:
@@ -418,9 +601,19 @@ class ExperimentManager:
             conn.close()
 
     def get_absolute_container_path(self, item_id: str) -> Optional[Path]:
-        """
-        Gets the full, absolute path for an item's container file by resolving
-        its relative path against the ExperimentManager's data directory.
+        """Get the absolute path to an item's container file.
+
+        Parameters
+        ----------
+        item_id : str
+            The unique ID of the item.
+
+        Returns
+        -------
+        Optional[Path]
+            The absolute `Path` to the container file, or `None` if the item
+            is not found.
+
         """
         try:
             item = self.__getitem__(item_id)
@@ -430,7 +623,18 @@ class ExperimentManager:
             return None
 
     def get_internal_index(self, item_id: str) -> Optional[str]:
-        """Gets the internal index for an item."""
+        """Get the internal index for an item.
+
+        Parameters
+        ----------
+        item_id : str
+            The unique ID of the item.
+
+        Returns
+        -------
+        Optional[str]
+            The internal index string, or `None` if the item is not found.
+        """
         try:
             item = self.__getitem__(item_id)
             return item.internal_index
@@ -438,7 +642,21 @@ class ExperimentManager:
             return None
 
     def _bulk_fetch_items(self, query: str) -> List[DataItem]:
-        """Generic helper for fetching multiple items."""
+        """Fetch a list of items from the database using a custom query.
+
+        This is an efficient helper method that fetches multiple items and all
+        their associated result files in a minimal number of database queries.
+
+        Parameters
+        ----------
+        query : str
+            The SQL `SELECT` query to execute to fetch the items.
+
+        Returns
+        -------
+        List[DataItem]
+            A list of hydrated `DataItem` objects.
+        """
         conn = self._get_connection()
         try:
             # 1. Fetch all matching item rows
@@ -479,23 +697,45 @@ class ExperimentManager:
             conn.close()
 
     def get_all_items(self) -> List[DataItem]:
-        """Returns a list of all DataItem objects from the database."""
+        """Return a list of all DataItem objects from the database.
+
+        Returns
+        -------
+        List[DataItem]
+            A list containing every `DataItem` in the database.
+        """
         return self._bulk_fetch_items("SELECT * FROM items")
 
     def get_unprocessed_items(self) -> List[DataItem]:
-        """Returns a list of all items that are not yet marked as processed."""
+        """Return a list of all items not yet marked as processed.
+
+        Returns
+        -------
+        List[DataItem]
+            A list of all `DataItem` objects where `processed` is False.
+        """
         # processed = 0 (False)
         return self._bulk_fetch_items("SELECT * FROM items WHERE processed = 0")
 
     def get_items_with_errors(self) -> List[DataItem]:
-        """Returns a list of all items that have an error message set."""
+        """Return a list of all items that have a recorded error.
+
+        Returns
+        -------
+        List[DataItem]
+            A list of all `DataItem` objects where the `error` field is not NULL.
+        """
         # error IS NOT NULL and processed = 0
         return self._bulk_fetch_items(
             "SELECT * FROM items WHERE error IS NOT NULL AND processed = 0"
         )
 
     def force_reprocess_all(self):
-        """Resets the 'processed' status for ALL items in the database."""
+        """Reset the 'processed' and 'error' status for all items.
+
+        This method marks all items in the database as unprocessed, allowing
+        them to be picked up again by a processing pipeline.
+        """
         print("Resetting 'processed' status for all items in the database.")
         conn = self._get_connection()
         try:
@@ -508,7 +748,11 @@ class ExperimentManager:
             conn.close()
 
     def reset_errors(self):
-        """Resets the 'processed' and 'error' status for all items that previously failed."""
+        """Reset the status for all items that previously failed.
+
+        This method finds all items with a non-null `error` field and resets
+        their `processed` and `error` statuses, allowing a re-attempt at processing.
+        """
         print("Resetting status for all items with errors in the database.")
         conn = self._get_connection()
         try:
@@ -524,7 +768,7 @@ class ExperimentManager:
             conn.close()
 
     def report_status(self):
-        """Prints a summary of the dataset status using fast SQL queries."""
+        """Print a summary of the dataset's processing status."""
         total = len(self)
         conn = self._get_connection()
         try:
