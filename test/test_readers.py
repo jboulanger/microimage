@@ -4,7 +4,14 @@ import xarray as xr
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from microimage.readers import LSMReader, TIFReader, CZIReader, Reader
+from microimage.readers import (
+    LSMReader,
+    TIFReader,
+    CZIReader,
+    ND2Reader,
+    Reader,
+)
+import dask.array as da
 
 
 @pytest.fixture
@@ -75,7 +82,7 @@ def test_lsm_reader_multi_scene_produces_xarray(mock_lsm_file_multi_scene):
             assert isinstance(reader, LSMReader)
             assert len(reader) == 2  # From the 'P' axis shape
 
-            scenes = list(reader.scenes())
+            scenes = list(reader.iter_scenes())
             assert len(scenes) == 2
 
             # --- Verify the first scene ---
@@ -113,10 +120,130 @@ def test_lsm_reader_single_scene(mock_lsm_file_single_scene):
             assert isinstance(reader, LSMReader)
             assert len(reader) == 1
 
-            scenes = list(reader.scenes())
+            scenes = list(reader.iter_scenes())
             assert len(scenes) == 1
 
             scene = scenes[0]
             assert isinstance(scene, xr.DataArray)
             assert scene.dims == ("Z", "Y", "X", "C")
             assert scene.shape == (5, 64, 64, 3)
+
+
+@pytest.fixture
+def mock_czi_file():
+    """Mocks a pylibczirw.CziFile object for a multi-scene CZI."""
+    mock_czi = MagicMock()
+
+    # --- Mock Dimensions and Shape ---
+    # 2 scenes, 5 Z, 64 Y, 64 X, 3 C
+    dims_shape_dict = {
+        "S": (0, 2),
+        "Z": (0, 5),
+        "Y": (0, 64),
+        "X": (0, 64),
+        "C": (0, 3),
+    }
+    all_dims = "SZCYX"
+    mock_czi.get_dims_shape.return_value = (dims_shape_dict, all_dims)
+
+    # --- Mock Metadata ---
+    mock_czi.metadata = {"Experiment": "Test1", "Sample": "CellCulture"}
+    mock_czi.channel_names = ["DAPI", "GFP", "mCherry"]
+    mock_czi.get_dimension_pixel_size.side_effect = lambda dim: {
+        "Z": 0.5,
+        "Y": 0.1,
+        "X": 0.1,
+    }.get(dim)
+
+    # --- Mock Data Reading ---
+    mock_czi.pixel_type.to_numpy_dtype.return_value = np.uint16
+    # This mock will be called by dask.delayed, so it should return the data directly
+    mock_czi.read_image.return_value = np.ones((5, 3, 64, 64), dtype=np.uint16)
+
+    return mock_czi
+
+
+def test_czi_reader_multi_scene(mock_czi_file):
+    """Verify CZIReader correctly handles a multi-scene file with lazy loading."""
+    dummy_path = Path("test.czi")
+    # Mock the context manager returned by open_czi
+    mock_context = MagicMock()
+    mock_context.__enter__.return_value = mock_czi_file
+    mock_context.__exit__.return_value = None
+
+    with patch(
+        "microimage.readers.pyczi.open_czi", return_value=mock_context
+    ) as mock_open_czi:
+        with Reader(dummy_path) as reader:
+            assert isinstance(reader, CZIReader)
+            assert len(reader) == 2  # 2 scenes from 'S' dimension
+
+            scenes = list(reader.iter_scenes())
+            assert len(scenes) == 2
+
+            scene_one = scenes[0]
+            assert isinstance(scene_one, xr.DataArray)
+            assert isinstance(scene_one.data, da.Array)  # Check for Dask array
+
+            # Check dimensions and shape (S is removed)
+            assert scene_one.dims == ("Z", "C", "Y", "X")
+            assert scene_one.shape == (5, 3, 64, 64)
+
+            # Check coordinates
+            np.testing.assert_array_equal(
+                scene_one.coords["C"].values, ["DAPI", "GFP", "mCherry"]
+            )
+            np.testing.assert_allclose(scene_one.coords["Z"].values, np.arange(5) * 0.5)
+
+            # Check attributes
+            assert scene_one.attrs["Experiment"] == "Test1"
+
+            # Trigger computation and check data
+            computed_data = scene_one.compute()
+            assert np.all(computed_data.values == 1)
+
+
+@pytest.fixture
+def mock_nd2_file():
+    """Mocks an nd2.ND2File object."""
+    mock_nd2 = MagicMock()
+
+    # --- Mock Dimensions ---
+    mock_nd2.sizes = {"P": 2, "T": 10, "Z": 5, "C": 3, "Y": 128, "X": 128}
+
+    # --- Mock Data Reading (to_xarray) ---
+    # Create a mock xarray that the nd2 mock can return
+    mock_data = da.zeros((2, 10, 5, 3, 128, 128), dtype=np.uint16)
+    mock_xarray = xr.DataArray(
+        mock_data,
+        dims=list("PTZCYX"),
+        attrs={"description": "A mock ND2 file"},
+        coords={"C": ["ch1", "ch2", "ch3"]},
+    )
+    mock_nd2.to_xarray.return_value = mock_xarray
+
+    return mock_nd2
+
+
+def test_nd2_reader_multi_position(mock_nd2_file):
+    """Verify ND2Reader correctly iterates through positions."""
+    dummy_path = Path("test.nd2")
+    with patch("nd2.ND2File", return_value=mock_nd2_file):
+        with Reader(dummy_path) as reader:
+            assert isinstance(reader, ND2Reader)
+            assert len(reader) == 2  # From 'P' dimension
+
+            scenes = list(reader.iter_scenes())
+            assert len(scenes) == 2
+
+            scene_one = scenes[0]
+            assert isinstance(scene_one, xr.DataArray)
+            assert isinstance(scene_one.data, da.Array)
+
+            # Check dimensions (P should be sliced away)
+            assert scene_one.dims == ("T", "Z", "C", "Y", "X")
+            assert scene_one.shape == (10, 5, 3, 128, 128)
+            assert scene_one.attrs["description"] == "A mock ND2 file"
+            np.testing.assert_array_equal(
+                scene_one.coords["C"].values, ["ch1", "ch2", "ch3"]
+            )

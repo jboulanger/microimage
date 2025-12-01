@@ -1,15 +1,37 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Generator, Self, Iterator
+from typing import Dict, Any, List, Generator, Self, Iterator, Tuple
 from pathlib import Path
 import tifffile
 import ome_types
 import numpy as np
 import xarray as xr
+import dask.array as da
+import dask
 
 try:
-    import pylibczirw
+    from pylibCZIrw import czi as pyczi
 except ImportError:
-    pylibczirw = None
+    pyczi = None
+
+try:
+    import nd2
+except ImportError:
+    nd2 = None
+
+try:
+    import liffile
+except ImportError:
+    liffile = None
+
+try:
+    import slideio
+except ImportError:
+    slideio = None
+
+try:
+    from imaris_ims_file_reader import ims as ims_reader
+except ImportError:
+    ims_reader = None
 
 
 class BaseReader(ABC):
@@ -38,7 +60,7 @@ class BaseReader(ABC):
         pass
 
     def __iter__(self) -> Iterator[xr.DataArray]:
-        return self.scenes()
+        return self.iter_scenes()
 
     @abstractmethod
     def __len__(self) -> int:
@@ -53,8 +75,8 @@ class BaseReader(ABC):
         pass
 
     @abstractmethod
-    def scenes(self) -> Generator[xr.DataArray, None, None]:
-        """Yield scenes from the image file as DataArrays.
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
+        """Yield each scene from the image file as a lazy `dask`-backed DataArray.
 
         This method is a generator that iterates through all scenes in
         the file, yielding each one as an `xarray.DataArray`.
@@ -124,7 +146,7 @@ class LSMReader(BaseReader):
             return self.tif.series[0].shape[p_index]
         return 1
 
-    def scenes(self, axes="TCZYX") -> Generator[xr.DataArray, None, None]:
+    def iter_scenes(self, axes="TCZYX") -> Generator[xr.DataArray, None, None]:
         """Yield scenes from the LSM file as xarray DataArrays.
 
         If the file contains multiple scenes (a 'P' axis), this generator
@@ -169,13 +191,11 @@ class LSMReader(BaseReader):
         if p_index >= 0:
             num_scenes = self.tif.series[0].shape[p_index]
             for k in range(num_scenes):
-                data = self.tif.series[0].asarray()[k]
-                print(data.shape)
+                data = self.tif.series[0].asarray(dask=True)[k]
                 scene_coords = {a: coords[a] for a in self.axes_str if a != "P"}
-                print("scene coords", scene_coords)
                 yield xr.DataArray(data, coords=scene_coords, attrs=self.metadata)
         else:
-            data = self.tif.asarray()
+            data = self.tif.asarray(dask=True)
             scene_coords = {a: coords[a] for a in self.axes_str if a != "P"}
             yield xr.DataArray(data, coords=scene_coords, attrs=self.metadata)
 
@@ -225,7 +245,7 @@ class TIFReader(BaseReader):
     def __len__(self) -> int:
         return len(self.tif.series)
 
-    def scenes(self) -> Generator[xr.DataArray, None, None]:
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
         """Yield each series in the TIFF file as a separate scene.
 
         This generator iterates through all series in the TIFF file. If OME-XML
@@ -245,7 +265,7 @@ class TIFReader(BaseReader):
         If OME metadata is not present or fails to parse, the resulting DataArray will have dimensions but may lack detailed coordinates.
         """
         for i, series in enumerate(self.tif.series):
-            data = series.asarray()
+            data = series.asarray(dask=True)
             dims = list(series.axes)
             coords = {}
             attrs = {}
@@ -317,18 +337,20 @@ class CZIReader(BaseReader):
 
     def __init__(self, path: Path):
         super().__init__(path)
-        if pylibczirw is None:
+        if pyczi is None:
             raise ImportError(
                 "pylibczirw is not installed. Please run 'pip install pylibczirw'"
             )
-        self.czi = pylibczirw.CziFile(path)
+        # Manually manage the context from pyczi.open_czi
+        self.czi_context = pyczi.open_czi(path)
+        self.czi = self.czi_context.__enter__()
         self.metadata = self.czi.metadata
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, type, value, traceback):
-        self.czi.close()
+        self.czi_context.__exit__(type, value, traceback)
 
     def __len__(self) -> int:
         """Return the number of scenes in the CZI file.
@@ -344,7 +366,7 @@ class CZIReader(BaseReader):
         """
         return self.czi.get_dims_shape()[0].get("S", (0, 1))[1]
 
-    def scenes(self) -> Generator[xr.DataArray, None, None]:
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
         """Yield scenes from the CZI file as xarray DataArrays.
 
         This generator iterates through each scene (mosaic tile) in the file,
@@ -357,6 +379,7 @@ class CZIReader(BaseReader):
         xr.DataArray
             A DataArray for each scene, with dimensions, coordinates, and metadata.
         """
+
         num_scenes = len(self)
         dims_shape = self.czi.get_dims_shape()[0]
 
@@ -364,13 +387,19 @@ class CZIReader(BaseReader):
             # Define the dimensions for reading this specific scene
             selector = {"S": scene_index}
 
-            # Read the image data for the scene. The result is a numpy array.
-            # The dimensions are ordered according to the file's dimension string.
-            data, read_dims = self.czi.read_image(**selector)
+            # LAZY LOADING: Wrap the read operation in dask.delayed.
+            # This creates a lazy dask array that only reads data when computed.
+            lazy_read = dask.delayed(self.czi.read_image)(**selector)
 
-            # Squeeze out the scene dimension from the data and the dimension string
-            data = data.squeeze()
-            dims = [d for d in read_dims if d != "S"]
+            # The shape and dtype must be known ahead of time for dask.
+            # We need to get the shape *after* applying the selector for 'S'
+            # and then removing 'S' from the dimensions for the scene.
+            dims_shape_dict, all_dims = self.czi.get_dims_shape()
+            shape_for_scene = tuple(dims_shape_dict[d][1] for d in all_dims if d != "S")
+            dtype = self.czi.pixel_type.to_numpy_dtype()
+
+            data = da.from_delayed(lazy_read, shape=shape_for_scene, dtype=dtype)
+            dims = [d for d in all_dims if d != "S"]
 
             # --- Build Coordinates ---
             coords = {}
@@ -397,8 +426,6 @@ class ND2Reader(BaseReader):
     """Reader for ND2 files from Nikon Elements.
 
     .. warning::
-        This reader is a placeholder and is not yet implemented.
-
     Parameters
     ----------
     path : Path
@@ -407,19 +434,50 @@ class ND2Reader(BaseReader):
 
     def __init__(self, path: Path):
         super().__init__(path)
-        pass
+        if nd2 is None:
+            raise ImportError("nd2 is not installed. Please run 'pip install nd2'")
+        self.nd2 = nd2.ND2File(path)
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, type, value, traceback):
-        pass
+        self.nd2.close()
 
     def __len__(self) -> int:
-        return 0
+        """Return the number of scenes in the ND2 file.
 
-    def scenes(self):
-        pass
+        The number of scenes corresponds to the size of the 'P' dimension
+        (positions/fields of view). If 'P' is not present, it defaults to 1.
+
+        Returns
+        -------
+        int
+            The number of scenes.
+        """
+        return self.nd2.sizes.get("P", 1)
+
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
+        """Yield scenes from the ND2 file as xarray DataArrays.
+
+        This generator uses the `nd2` library's `to_xarray` method to create
+        a Dask-backed xarray DataArray for the entire file. If the file contains
+        multiple scenes (indicated by a 'P' dimension), it iterates through
+        and yields each scene. Otherwise, it yields the single DataArray.
+
+        Yields
+        ------
+        xr.DataArray
+            A DataArray for each scene, with dimensions, coordinates, and metadata.
+        """
+        # Get the full xarray DataArray, which will be dask-backed
+        full_xarray = self.nd2.to_xarray(delayed=True)
+
+        if "P" in full_xarray.dims:
+            for p_idx in range(full_xarray.sizes["P"]):
+                yield full_xarray.isel(P=p_idx)
+        else:
+            yield full_xarray
 
 
 READER_REGISTRY[".nd2"] = ND2Reader
@@ -428,33 +486,261 @@ READER_REGISTRY[".nd2"] = ND2Reader
 class LIFReader(BaseReader):
     """Reader for LIF (Leica Image File) format from Leica LAS X.
 
-    .. warning::
-        This reader is a placeholder and is not yet implemented.
+    This reader uses the `liffile` library to parse `.lif` files. It treats
+    each image series within the file as a separate scene.
 
     Parameters
     ----------
     path : Path
         The file path to the `.lif` file.
+
+    Attributes
+    ----------
+    lif : liffile.LifFile
+        The underlying `LifFile` object.
+
+    Raises
+    ------
+    ImportError
+        If the `liffile` library is not installed.
     """
 
     def __init__(self, path: Path):
         super().__init__(path)
-        pass
+        if liffile is None:
+            raise ImportError(
+                "liffile is not installed. Please run 'pip install liffile'"
+            )
+        self.lif = liffile.LifFile(path)
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, type, value, traceback):
-        pass
+        self.lif.close()
 
     def __len__(self) -> int:
-        return 0
+        """Return the number of image series in the LIF file."""
+        return len(self.lif.series)
 
-    def scenes(self):
-        pass
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
+        """Yield each image series in the LIF file as a separate scene.
+
+        This generator iterates through all series in the LIF file, creating
+        a Dask-backed `xarray.DataArray` for each one. It extracts dimensional
+        scaling and names from the LIF metadata to populate the coordinates.
+
+        Yields
+        ------
+        xr.DataArray
+            A lazy-loaded DataArray for each series, with dimensions,
+            coordinates, and metadata.
+        """
+        for i, series in enumerate(self.lif.series):
+            # Use dask=True for lazy loading
+            data = series.asarray(dask=True)
+            dims = list(series.axes)
+            attrs = {"name": series.name, **series.info}
+
+            # Create coordinates from scale and unit info
+            coords = {
+                dim: np.arange(size) * scale
+                for dim, size, scale in zip(dims, series.shape, series.scale)
+                if scale is not None
+            }
+
+            yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
 
 
 READER_REGISTRY[".lif"] = LIFReader
+
+
+class VSIReader(BaseReader):
+    """Reader for Olympus VSI (Virtual Slide Image) files.
+
+    This reader uses the `slideio` library, which is designed for whole-slide
+    images. It treats each scene within the VSI file as a separate item.
+
+    Parameters
+    ----------
+    path : Path
+        The file path to the `.vsi` file.
+    chunk_size : Tuple[int, int], optional
+        The (Y, X) dimensions for each Dask chunk, by default (2048, 2048).
+
+    Attributes
+    ----------
+    slide : slideio.Slide
+        The underlying `Slide` object from the slideio library.
+
+    Raises
+    ------
+    ImportError
+        If the `slideio` library is not installed.
+    """
+
+    def __init__(self, path: Path, chunk_size: Tuple[int, int] = (2048, 2048)):
+        super().__init__(path)
+        if slideio is None:
+            raise ImportError(
+                "slideio is not installed. Please run 'pip install slideio'"
+            )
+        self.chunk_size = chunk_size
+        self.slide = slideio.open_slide(str(path), "VSI")
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, type, value, traceback):
+        # slideio objects manage their own resources and do not have a close() method
+        pass
+
+    def __len__(self) -> int:
+        """Return the number of scenes in the VSI file."""
+        return self.slide.num_scenes
+
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
+        """Yield each scene from the VSI file as a lazy xarray DataArray.
+
+        This generator iterates through all scenes in the VSI file. The reading
+        of pixel data is deferred using `dask.delayed` to ensure lazy loading.
+        Metadata such as resolution and channel names are extracted for the
+        xarray object.
+
+        Yields
+        ------
+        xr.DataArray
+            A lazy-loaded DataArray for each scene.
+        """
+        for i in range(self.slide.num_scenes):
+            scene = self.slide.get_scene(i)
+
+            # Define shape, dtype, and dims for the dask array
+            dims = ["Y", "X", "C"]
+            shape = (scene.size[1], scene.size[0], scene.num_channels)
+            dtype = scene.channel_data_types[0] if scene.num_channels > 0 else np.uint8
+
+            # --- CHUNKED LAZY LOADING ---
+            # Instead of loading the whole image in one go, create a dask array
+            # from a grid of lazy-loaded chunks. This is crucial for WSI.
+            dask_chunk_size = (*self.chunk_size, shape[2])
+
+            # Create a function that reads a specific block of the image
+            def get_chunk(block_info=None):
+                loc = block_info[0]["array-location"]
+                y_start, y_end = loc[0]
+                x_start, x_end = loc[1]
+                # slideio uses (x, y, w, h) for rect
+                rect = (x_start, y_start, x_end - x_start, y_end - y_start)
+                return scene.read_block(rect=rect)
+
+            # Use dask.array.map_blocks to create the chunked array.
+            # We start with a dummy array of zeros to define the shape and chunking,
+            # then map our reading function over it. The channel dimension is always fully loaded.
+            dummy_array = da.zeros(shape, chunks=dask_chunk_size, dtype=dtype)
+            data = dummy_array.map_blocks(get_chunk, dtype=dtype)
+
+            # Build coordinates from resolution metadata
+            coords = {}
+            resolution = scene.resolution
+            if resolution[0] > 0:
+                # Note: slideio resolution is in meters per pixel
+                coords["X"] = np.arange(shape[1]) * resolution[0]
+            if resolution[1] > 0:
+                coords["Y"] = np.arange(shape[0]) * resolution[1]
+
+            attrs = {"name": scene.name, "magnification": scene.magnification}
+
+            yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
+
+
+READER_REGISTRY[".vsi"] = VSIReader
+
+
+class IMSReader(BaseReader):
+    """Reader for Bitplane Imaris IMS files.
+
+    This reader uses the `imaris-ims-file-reader` library to parse `.ims`
+    files, which are based on the HDF5 format. An IMS file is treated as a
+    single, multi-dimensional scene.
+
+    Parameters
+    ----------
+    path : Path
+        The file path to the `.ims` file.
+
+    Attributes
+    ----------
+    ims : imaris_ims_file_reader.ims
+        The underlying IMS file reader object.
+
+    Raises
+    ------
+    ImportError
+        If the `imaris-ims-file-reader` library is not installed.
+    """
+
+    def __init__(self, path: Path):
+        super().__init__(path)
+        if ims_reader is None:
+            raise ImportError(
+                "imaris-ims-file-reader is not installed. "
+                "Please run 'pip install imaris-ims-file-reader'"
+            )
+        # The library itself handles lazy loading via dask
+        self.ims = ims_reader(path)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, type, value, traceback):
+        # The underlying h5py file is managed by the ims object
+        pass
+
+    def __len__(self) -> int:
+        """Return the number of scenes. IMS files are considered single-scene."""
+        return 1
+
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
+        """Yield the entire IMS file as a single, lazy xarray DataArray.
+
+        This method wraps the Dask array provided by `imaris-ims-file-reader`
+        into an `xarray.DataArray`. It extracts dimensional information and
+        metadata to construct the coordinates and attributes.
+
+        Yields
+        ------
+        xr.DataArray
+            A lazy-loaded DataArray representing the entire IMS dataset.
+        """
+        # The ims object provides a dask array directly. We work with the highest resolution (level 0).
+        # The shape from the reader is (t, c, z, y, x)
+        data = self.ims.get_dask_array(0)
+        dims = ["T", "C", "Z", "Y", "X"]
+
+        # Extract metadata and coordinates
+        attrs = self.ims.get_parameters_dict()
+        coords = {}
+
+        # Time coordinates
+        if "TimePoints" in attrs and self.ims.TimePoints > 1:
+            # Assuming time interval is stored in seconds, but this may need verification
+            time_interval = float(attrs.get("TimeInterval", 1.0))
+            coords["T"] = np.arange(self.ims.TimePoints) * time_interval
+
+        # Channel coordinates
+        if "ChannelNames" in attrs:
+            coords["C"] = attrs["ChannelNames"]
+
+        # Spatial coordinates (X, Y, Z)
+        for i, dim in enumerate(["X", "Y", "Z"]):
+            voxel_size = self.ims.get_voxel_size(i)
+            coords[dim] = np.arange(data.shape[-(i + 1)]) * voxel_size
+
+        yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
+
+
+READER_REGISTRY[".ims"] = IMSReader
 
 
 class Reader:

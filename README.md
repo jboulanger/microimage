@@ -4,14 +4,27 @@ This project aims at factoring code that is used repetitively when developing wo
 
 It is composed of a dataset management, unified image reader that decode basic metadata to xarray and basic batch processing.
 
-
 ## Installation
 
 ```bash
 pip install ...
 ```
 
+## Data organization
+
+```bash
+.
+├── data
+│   ├── image001.lsm
+│   ├── image002.lsm
+│   └── image003.lsm
+└── project
+    └── project.db
+```
+
 ## Usage
+
+
 
 ```python
 from microimage import ExperimentManager, MetadataParser
