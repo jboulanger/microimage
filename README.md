@@ -24,6 +24,10 @@ pip install ...
 
 ## Usage
 
+- The reader load the data and metadata from various formats as xarrays
+- The metadataparser add extra metadata to the database.
+- A tool help curate these metadata.
+- The ExperimentManager store list of files path with extra metadata and result files.
 
 
 ```python

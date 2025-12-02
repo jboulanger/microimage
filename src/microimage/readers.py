@@ -6,6 +6,8 @@ import ome_types
 import numpy as np
 import xarray as xr
 import dask.array as da
+import hashlib
+import os
 import dask
 
 try:
@@ -32,6 +34,17 @@ try:
     from imaris_ims_file_reader import ims as ims_reader
 except ImportError:
     ims_reader = None
+
+
+def generate_scene_id(path: Path, scene_index: int) -> str:
+    """Generates a unique SHA1 hash ID for a scene.
+
+    The ID is based on the file's name, its last modification time (in
+    nanoseconds), and the scene's index within the file.
+    """
+    mod_time = os.stat(path).st_mtime_ns
+    id_string = f"{path.name}-{mod_time}-{scene_index}"
+    return hashlib.sha1(id_string.encode()).hexdigest()
 
 
 class BaseReader(ABC):
@@ -146,18 +159,12 @@ class LSMReader(BaseReader):
             return self.tif.series[0].shape[p_index]
         return 1
 
-    def iter_scenes(self, axes="TCZYX") -> Generator[xr.DataArray, None, None]:
+    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
         """Yield scenes from the LSM file as xarray DataArrays.
 
         If the file contains multiple scenes (a 'P' axis), this generator
         iterates through each scene. Otherwise, it yields the single primary
         image. It attempts to parse dimensional coordinates from the LSM metadata.
-
-        Parameters
-        ----------
-        axes : str, optional
-            A string representing the desired order of axes, by default "TCZYX".
-            This parameter is currently used for coordinate mapping.
 
         Yields
         ------
@@ -167,10 +174,8 @@ class LSMReader(BaseReader):
         """
         try:
             coords = {
-                "T": [
-                    t * self.metadata["TimeIntervall"]
-                    for t in range(self.metadata["DimensionTime"])
-                ],
+                "time": np.arange(self.metadata["DimensionTime"])
+                * self.metadata.get("TimeIntervall", 1.0),
                 "Z": [
                     z * self.metadata["VoxelSizeZ"]
                     for z in range(self.metadata["DimensionZ"])
@@ -185,19 +190,43 @@ class LSMReader(BaseReader):
                 ],
                 "C": self.metadata["ChannelColors"]["ColorNames"],
             }
+            # Convert time in seconds to timedelta objects
+            if "time" in coords:
+                coords["time"] = [
+                    np.timedelta64(int(s * 1e9), "ns") for s in coords["time"]
+                ]
+
         except Exception:
             coords = {}
         p_index = self.axes_str.find("P")
+        # Rename 'T' dimension to 'time' if it exists
+        current_axes = self.axes_str.replace("T", "time")
+
         if p_index >= 0:
             num_scenes = self.tif.series[0].shape[p_index]
             for k in range(num_scenes):
-                data = self.tif.series[0].asarray(dask=True)[k]
-                scene_coords = {a: coords[a] for a in self.axes_str if a != "P"}
-                yield xr.DataArray(data, coords=scene_coords, attrs=self.metadata)
+                store = self.tif.series[0].aszarr()
+                data = dask.array.from_zarr(store)[k]
+                scene_id = generate_scene_id(self.path, k)
+                scene_attrs = {**self.metadata, "unique_id": scene_id}
+                scene_dims = [d for d in current_axes if d != "P"]
+                scene_coords = {a: coords[a] for a in scene_dims if a in coords}
+                yield xr.DataArray(
+                    data, dims=scene_dims, coords=scene_coords, attrs=scene_attrs
+                )
         else:
-            data = self.tif.asarray(dask=True)
-            scene_coords = {a: coords[a] for a in self.axes_str if a != "P"}
-            yield xr.DataArray(data, coords=scene_coords, attrs=self.metadata)
+            store = self.tif.series[0].aszarr()
+            data = dask.array.from_zarr(store)
+            scene_dims = [d for d in current_axes if d != "P"]
+            scene_coords = {a: coords[a] for a in scene_dims if a in coords}
+            yield xr.DataArray(
+                data, dims=scene_dims, coords=scene_coords, attrs=self.metadata
+            )
+            scene_id = generate_scene_id(self.path, 0)
+            scene_attrs = {**self.metadata, "unique_id": scene_id}
+            yield xr.DataArray(
+                data, dims=scene_dims, coords=scene_coords, attrs=scene_attrs
+            )
 
 
 READER_REGISTRY[".lsm"] = LSMReader
@@ -267,44 +296,64 @@ class TIFReader(BaseReader):
         for i, series in enumerate(self.tif.series):
             data = series.asarray(dask=True)
             dims = list(series.axes)
+            if "T" in dims:
+                dims[dims.index("T")] = "time"
             coords = {}
             attrs = {}
             # Try to get coordinates and metadata from OME structure
             if self.ome and i < len(self.ome.images):
                 pixels = self.ome.images[i].pixels
-                attrs = {"name": self.ome.images[i].name}
-                try:
-                    coords = {
-                        "T": [t * pixels.physical_size_t for t in range(pixels.size_t)]
-                        if pixels.physical_size_t
-                        else None,
-                        "Z": [z * pixels.physical_size_z for z in range(pixels.size_z)]
-                        if pixels.physical_size_z
-                        else None,
-                        "Y": [y * pixels.physical_size_y for y in range(pixels.size_y)]
-                        if pixels.physical_size_y
-                        else None,
-                        "X": [x * pixels.physical_size_x for x in range(pixels.size_x)]
-                        if pixels.physical_size_x
-                        else None,
-                        "C": [
-                            c.name or str(ch_idx)
-                            for ch_idx, c in enumerate(pixels.channels)
-                        ],
-                    }
-                    # Filter out empty or mismatched coords
-                    scene_coords = {
-                        d: c
-                        for d, c in coords.items()
-                        if d in dims
-                        and c is not None
-                        and len(c) == data.shape[dims.index(d)]
-                    }
-                    coords = scene_coords
-                except Exception:
-                    coords = {}  # Fallback on parsing error
+                attrs = {"name": self.ome.images[i].name}  # noqa
+                coords = self._get_ome_coords(pixels, dims, data.shape)
 
-            yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
+            scene_id = generate_scene_id(self.path, i)
+            yield xr.DataArray(
+                data, dims=dims, coords=coords, attrs={**attrs, "unique_id": scene_id}
+            )
+
+    def _get_ome_coords(self, pixels, dims, shape) -> Dict:
+        """Helper to extract coordinates from OME.pixels."""
+        coords = {}
+        try:
+            possible_coords = {
+                "time": None,  # Handle time separately
+                "Z": [z * pixels.physical_size_z for z in range(pixels.size_z)]
+                if pixels.physical_size_z
+                else None,
+                "Y": [y * pixels.physical_size_y for y in range(pixels.size_y)]
+                if pixels.physical_size_y
+                else None,
+                "X": [x * pixels.physical_size_x for x in range(pixels.size_x)]
+                if pixels.physical_size_x
+                else None,
+                "C": [
+                    c.name or str(ch_idx) for ch_idx, c in enumerate(pixels.channels)
+                ],
+            }
+
+            # Handle time coordinates with datetime if possible
+            if pixels.size_t > 1 and pixels.physical_size_t is not None:
+                time_increment_s = pixels.physical_size_t  # Assuming seconds
+                # If we have an absolute start time, create datetime objects
+                if self.ome.images and self.ome.images[0].acquisition_date:
+                    start_time = np.datetime64(self.ome.images[0].acquisition_date)
+                    time_deltas = np.arange(pixels.size_t) * time_increment_s
+                    possible_coords["time"] = start_time + np.array(
+                        [np.timedelta64(int(s * 1e9), "ns") for s in time_deltas]
+                    )
+                else:  # Otherwise, use timedeltas from zero
+                    time_deltas = np.arange(pixels.size_t) * time_increment_s
+                    possible_coords["time"] = [
+                        np.timedelta64(int(s * 1e9), "ns") for s in time_deltas
+                    ]
+
+            # Filter out empty or mismatched coords
+            for d, c in possible_coords.items():
+                if d in dims and c is not None and len(c) == shape[dims.index(d)]:
+                    coords[d] = c
+        except Exception:
+            return {}  # Fallback on any parsing error
+        return coords
 
 
 READER_REGISTRY[".tif"] = TIFReader
@@ -416,7 +465,9 @@ class CZIReader(BaseReader):
                 coords["C"] = self.czi.channel_names
 
             # Create and yield the DataArray
-            yield xr.DataArray(data, dims=dims, coords=coords, attrs=self.metadata)
+            scene_id = generate_scene_id(self.path, scene_index)
+            scene_attrs = {**self.metadata, "unique_id": scene_id}
+            yield xr.DataArray(data, dims=dims, coords=coords, attrs=scene_attrs)
 
 
 READER_REGISTRY[".czi"] = CZIReader
@@ -473,10 +524,17 @@ class ND2Reader(BaseReader):
         # Get the full xarray DataArray, which will be dask-backed
         full_xarray = self.nd2.to_xarray(delayed=True)
 
+        if "T" in full_xarray.dims:
+            full_xarray = full_xarray.rename({"T": "time"})
+
         if "P" in full_xarray.dims:
             for p_idx in range(full_xarray.sizes["P"]):
-                yield full_xarray.isel(P=p_idx)
+                scene_data = full_xarray.isel(P=p_idx)
+                scene_id = generate_scene_id(self.path, p_idx)
+                scene_data.attrs["unique_id"] = scene_id
+                yield scene_data
         else:
+            full_xarray.attrs["unique_id"] = generate_scene_id(self.path, 0)
             yield full_xarray
 
 
@@ -540,6 +598,8 @@ class LIFReader(BaseReader):
             # Use dask=True for lazy loading
             data = series.asarray(dask=True)
             dims = list(series.axes)
+            if "T" in dims:
+                dims[dims.index("T")] = "time"
             attrs = {"name": series.name, **series.info}
 
             # Create coordinates from scale and unit info
@@ -548,7 +608,8 @@ class LIFReader(BaseReader):
                 for dim, size, scale in zip(dims, series.shape, series.scale)
                 if scale is not None
             }
-
+            scene_id = generate_scene_id(self.path, i)
+            attrs["unique_id"] = scene_id
             yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
 
 
@@ -649,8 +710,9 @@ class VSIReader(BaseReader):
             if resolution[1] > 0:
                 coords["Y"] = np.arange(shape[0]) * resolution[1]
 
-            attrs = {"name": scene.name, "magnification": scene.magnification}
-
+            attrs = {"name": scene.name, "magnification": scene.magnification}  # noqa
+            scene_id = generate_scene_id(self.path, i)
+            attrs["unique_id"] = scene_id
             yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
 
 
@@ -716,17 +778,20 @@ class IMSReader(BaseReader):
         # The ims object provides a dask array directly. We work with the highest resolution (level 0).
         # The shape from the reader is (t, c, z, y, x)
         data = self.ims.get_dask_array(0)
-        dims = ["T", "C", "Z", "Y", "X"]
+        dims = ["time", "C", "Z", "Y", "X"]
 
         # Extract metadata and coordinates
         attrs = self.ims.get_parameters_dict()
         coords = {}
 
         # Time coordinates
-        if "TimePoints" in attrs and self.ims.TimePoints > 1:
+        if "time" in dims and self.ims.TimePoints > 1:
             # Assuming time interval is stored in seconds, but this may need verification
             time_interval = float(attrs.get("TimeInterval", 1.0))
-            coords["T"] = np.arange(self.ims.TimePoints) * time_interval
+            coords["time"] = [
+                np.timedelta64(int(s * 1e9), "ns")
+                for s in (np.arange(self.ims.TimePoints) * time_interval)
+            ]
 
         # Channel coordinates
         if "ChannelNames" in attrs:
@@ -737,6 +802,8 @@ class IMSReader(BaseReader):
             voxel_size = self.ims.get_voxel_size(i)
             coords[dim] = np.arange(data.shape[-(i + 1)]) * voxel_size
 
+        scene_id = generate_scene_id(self.path, 0)
+        attrs["unique_id"] = scene_id
         yield xr.DataArray(data, dims=dims, coords=coords, attrs=attrs)
 
 
@@ -816,7 +883,7 @@ class MetadataParser:
         List[Dict[str, Any]]
             A list of dictionaries, where each dictionary represents a scene.
             Each dictionary contains an 'internal_index' (the scene number as a
-            string) and a 'metadata' dictionary.
+            string) and a 'metadata' dictionary. This will be renamed to 'scene'.
 
         """
         items = []
@@ -825,20 +892,10 @@ class MetadataParser:
                 # scene is now an xarray.DataArray, its metadata is in .attrs
                 # Combine scene-specific metadata with any extra metadata
                 combined_metadata = {**(self.extra_metadata or {}), **scene.attrs}
-                items.append({"internal_index": str(k), "metadata": combined_metadata})
+                items.append(
+                    {
+                        "scene": str(k),
+                        "metadata": combined_metadata,
+                    }
+                )
         return items
-
-
-# option 1
-if __name__ == "__main__":
-    filename = "test.lsm"
-    with Reader(filename) as file:
-        for img in file:
-            print(img.shape)
-
-# option 2
-if __name__ == "__main__":
-    filename = "test.lsm"
-    with Reader(filename) as file:
-        for scene in file:
-            print(scene.metadata)

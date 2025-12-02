@@ -11,36 +11,38 @@ from microimage.readers import (
     ND2Reader,
     Reader,
 )
+
 import dask.array as da
+import tifffile
+import zarr
 
 
 @pytest.fixture
 def mock_lsm_file_multi_scene():
     """Mocks a tifffile.TiffFile object for a multi-scene LSM file."""
     mock_tif = MagicMock()
-
+    shape = (2, 5, 64, 64, 3)  # 2 scenes, 5 z-slices, 64x64, 3 channels
+    store = zarr.storage.MemoryStore()
     # --- Mock Series Data ---
     mock_series = MagicMock()
     mock_series.axes = "PZYXC"  # P for Position/Scene
-    mock_series.shape = (2, 5, 64, 64, 3)  # 2 scenes, 5 z-slices, 64x64, 3 channels
+    mock_series.shape = shape  # 2 scenes, 5 z-slices, 64x64, 3 channels
+    mock_series.aszarr.return_value = zarr.create(shape=shape, store=store)
     mock_tif.series = [mock_series]
 
     # --- Mock Metadata (LSMReader uses lsm_metadata dict) ---
     mock_tif.lsm_metadata = {
-        "VoxelSizeZ": 0.5,
-        "VoxelSizeY": 0.1,
-        "VoxelSizeX": 0.1,
+        "VoxelSizeZ": 6.5e-7,
+        "VoxelSizeY": 6.5e-8,
+        "VoxelSizeX": 6.5e-8,
         "TimeIntervall": 0,
-        "DimensionZ": 5,
-        "DimensionY": 64,
-        "DimensionX": 64,
+        "DimensionZ": shape[1],
+        "DimensionY": shape[2],
+        "DimensionX": shape[3],
         "DimensionTime": 1,
+        "DimensionChannels": shape[4],
         "ChannelColors": {"ColorNames": ["DAPI", "GFP", "Cy5"]},
     }
-
-    # --- Mock asarray method on the series object ---
-    # The reader calls series.asarray(), so we mock that.
-    mock_series.asarray.return_value = np.ones((2, 5, 64, 64, 3), dtype=np.uint8)
 
     return mock_tif
 
@@ -48,23 +50,27 @@ def mock_lsm_file_multi_scene():
 @pytest.fixture
 def mock_lsm_file_single_scene():
     """Mocks a tifffile.TiffFile object for a single-scene LSM file."""
+    shape = (5, 64, 64, 3)  # 5 z-slices, 64x64, 3 channels
+    store = zarr.storage.MemoryStore()
     mock_tif = MagicMock()
     mock_series = MagicMock()
     mock_series.axes = "ZYXC"  # No 'P' axis
-    mock_series.shape = (5, 64, 64, 3)
+    mock_series.shape = shape
+    mock_series.aszarr.return_value = zarr.create(shape=shape, store=store)
     mock_tif.series = [mock_series]
     mock_tif.lsm_metadata = {
-        "VoxelSizeZ": 0.5,
-        "VoxelSizeY": 0.1,
-        "VoxelSizeX": 0.1,
+        "VoxelSizeZ": 6.5e-7,
+        "VoxelSizeY": 6.5e-8,
+        "VoxelSizeX": 6.5e-8,
         "TimeIntervall": 0,
-        "DimensionZ": 5,
-        "DimensionY": 64,
-        "DimensionX": 64,
+        "DimensionZ": shape[0],
+        "DimensionY": shape[1],
+        "DimensionX": shape[2],
         "DimensionTime": 1,
+        "DimensionChannels": shape[3],
         "ChannelColors": {"ColorNames": ["DAPI", "GFP", "Cy5"]},
     }
-    mock_tif.asarray.return_value = np.zeros((5, 64, 64, 3), dtype=np.uint8)
+
     return mock_tif
 
 
@@ -99,15 +105,19 @@ def test_lsm_reader_multi_scene_produces_xarray(mock_lsm_file_multi_scene):
             np.testing.assert_array_equal(
                 scene_one.coords["C"].values, ["DAPI", "GFP", "Cy5"]
             )
-            np.testing.assert_allclose(scene_one.coords["Z"].values, np.arange(5) * 0.5)
+            np.testing.assert_allclose(
+                scene_one.coords["Z"].values, np.arange(5) * 6.5e-7
+            )
 
             # Check that the data is correct for the first scene
-            assert np.all(scene_one.values == 1.0)
+            assert np.all(scene_one.compute().values == 0.0)
 
             # --- Verify the second scene ---
             scene_two = scenes[1]
             assert isinstance(scene_two, xr.DataArray)
-            assert np.all(scene_two.values == 1.0)  # Data is the same in this mock
+            assert np.all(
+                scene_two.compute().values == 0.0
+            )  # Data is the same in this mock
 
 
 def test_lsm_reader_single_scene(mock_lsm_file_single_scene):
@@ -241,7 +251,7 @@ def test_nd2_reader_multi_position(mock_nd2_file):
             assert isinstance(scene_one.data, da.Array)
 
             # Check dimensions (P should be sliced away)
-            assert scene_one.dims == ("T", "Z", "C", "Y", "X")
+            assert scene_one.dims == ("time", "Z", "C", "Y", "X")
             assert scene_one.shape == (10, 5, 3, 128, 128)
             assert scene_one.attrs["description"] == "A mock ND2 file"
             np.testing.assert_array_equal(

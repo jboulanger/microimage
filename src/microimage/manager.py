@@ -5,6 +5,10 @@ from typing import List, Dict, Any, Optional, Union, Iterator, Tuple, Callable
 from pathlib import Path
 from dataclasses import dataclass, field
 from itertools import chain
+import xarray as xr
+import numpy as np
+
+from .readers import Reader
 
 
 # Custom connection factory to return dictionary rows instead of tuples
@@ -30,7 +34,9 @@ def dict_factory(cursor, row):
 
 # Type hint for the new parser function: takes a Path and returns a list of sub-item data dictionaries.
 # Each dictionary MUST contain at least 'internal_index' and 'metadata'.
-MultiFileParser = Callable[[Path], List[Dict[str, Any]]]
+MultiFileParser = Callable[
+    [Path], List[Dict[str, Any]]
+]  # Each dict should contain 'scene' and 'metadata'
 
 
 @dataclass
@@ -48,9 +54,9 @@ class DataItem:
     relative_image_path : Path
         The path to the container file, relative to the `ExperimentManager`'s
         `data_dir`.
-    internal_index : str, optional
+    scene : str, optional
         A unique identifier for the item within its container file (e.g., a
-        scene number or series index). Defaults to "".
+        scene number). Defaults to "".
 
     Attributes
     ----------
@@ -71,29 +77,30 @@ class DataItem:
     # Required field, points to the container file
     relative_image_path: Path
 
-    # NEW: Index/identifier for the specific image within the container file
-    internal_index: str = ""
+    # The unique, hash-based identifier for this item.
+    id: str
 
     # Fields with default values
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    scene: str = field(default="")  # The original scene index (e.g., "0", "1")
+    metadata: Dict[str, Any] = field(default_factory=dict)  # noqa
     # This remains a Dict[type: path] in memory, but is stored in a separate DB table.
     # NOTE: Result paths are stored relative to ExperimentManager's project_root (DB parent).
     result_files: Dict[str, str] = field(default_factory=dict)
     processed: bool = field(default=False)
+
+    # NEW: Fields for basic dimensional metadata
+    size_t: Optional[int] = field(default=None)
+    size_c: Optional[int] = field(default=None)
+    size_z: Optional[int] = field(default=None)
+    size_y: Optional[int] = field(default=None)
+    size_x: Optional[int] = field(default=None)
+    scale_t: Optional[float] = field(default=None)
+    scale_z: Optional[float] = field(default=None)
+    scale_y: Optional[float] = field(default=None)
+    scale_x: Optional[float] = field(default=None)
+    channels: Optional[List[str]] = field(default=None)
+
     error: Optional[str] = field(default=None)
-
-    # ID is derived from the path and index and is not passed to __init__
-    id: str = field(init=False)
-
-    def __post_init__(self):
-        """Called automatically after __init__ to set derived fields."""
-        container_name = self.relative_image_path.name
-        if self.internal_index:
-            # Compound ID: Filename:Index (ensuring uniqueness)
-            self.id = f"{container_name}:{self.internal_index}"
-        else:
-            # Fallback for single-image files (ID is just the filename)
-            self.id = container_name
 
     def add_metadata(self, metadata_dict: Dict[str, Any]):
         """Add or update key-value pairs in the item's metadata.
@@ -161,10 +168,22 @@ class DataItem:
         return {
             "id": self.id,
             "relative_image_path": str(self.relative_image_path),
-            "internal_index": self.internal_index,
+            "scene": self.scene,
             "metadata": json.dumps(self.metadata),
             "processed": int(self.processed),
             "error": self.error,
+            "size_t": self.size_t,
+            "size_c": self.size_c,
+            "size_z": self.size_z,
+            "size_y": self.size_y,
+            "size_x": self.size_x,
+            "scale_t": self.scale_t,
+            "scale_z": self.scale_z,
+            "scale_y": self.scale_y,
+            "scale_x": self.scale_x,
+            "channels": json.dumps(self.channels)
+            if self.channels is not None
+            else None,
         }
 
     @classmethod
@@ -190,16 +209,33 @@ class DataItem:
         if relative_path_str is None:
             raise ValueError("Database row missing 'relative_image_path' key.")
 
-        # Extract the new field
-        internal_index = data.get("internal_index", "")
+        item_id = data.get("id")
+        if not item_id:
+            raise ValueError("Database row missing 'id' key.")
 
-        # Instantiate the dataclass with the required argument
-        item = cls(Path(relative_path_str), internal_index=internal_index)
+        scene = data.get("scene", "")
+        item = cls(id=item_id, relative_image_path=Path(relative_path_str), scene=scene)
 
         # Hydrate the rest of the fields
         item.metadata = json.loads(data.get("metadata", "{}") or "{}")
         item.processed = bool(data.get("processed", 0))
         item.error = data.get("error", None)
+
+        # Hydrate dimensional metadata
+        item.size_t = data.get("size_t")
+        item.size_c = data.get("size_c")
+        item.size_z = data.get("size_z")
+        item.size_y = data.get("size_y")
+        item.size_x = data.get("size_x")
+        item.scale_t = data.get("scale_t")
+        item.scale_z = data.get("scale_z")
+        item.scale_y = data.get("scale_y")
+        item.scale_x = data.get("scale_x")
+
+        # Hydrate channels from JSON
+        channels_json = data.get("channels")
+        if channels_json:
+            item.channels = json.loads(channels_json)
 
         if result_files:
             item.result_files = result_files
@@ -302,10 +338,20 @@ class ExperimentManager:
                 CREATE TABLE IF NOT EXISTS items (
                     id TEXT PRIMARY KEY,
                     relative_image_path TEXT NOT NULL,
-                    internal_index TEXT NOT NULL,
+                    scene TEXT NOT NULL,
                     metadata TEXT,
                     processed INTEGER NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    size_t INTEGER,
+                    size_c INTEGER,
+                    size_z INTEGER,
+                    size_y INTEGER,
+                    size_x INTEGER,
+                    scale_t REAL,
+                    scale_z REAL,
+                    scale_y REAL,
+                    scale_x REAL,
+                    channels TEXT
                 )
             """)
 
@@ -443,6 +489,58 @@ class ExperimentManager:
 
     # --- Utility Methods ---
 
+    def extract_dims_from_xarray(self, data: xr.DataArray) -> Dict[str, Any]:
+        """Extracts size and scale information from an xarray.DataArray.
+
+        Parameters
+        ----------
+        data : xr.DataArray
+            The DataArray from which to extract metadata.
+
+        Returns
+        -------
+        Dict[str, Any]
+            A dictionary containing size and scale values for dimensions.
+        """
+        dims_meta = {}
+        # Map xarray dimension names to our database field suffixes
+        dim_map = {
+            "T": "t",
+            "time": "t",
+            "C": "c",
+            "Z": "z",
+            "Y": "y",
+            "X": "x",
+        }
+
+        for da_dim, db_suffix in dim_map.items():
+            # Store size if the dimension exists
+            if da_dim in data.sizes:
+                dims_meta[f"size_{db_suffix}"] = data.sizes[da_dim]
+
+            # Calculate and store scale if coordinates are available and numeric
+            if da_dim in data.coords:
+                coords = data.coords[da_dim].values
+                if coords.ndim == 1 and len(coords) > 1:
+                    # Use the difference between the first two points as the scale
+                    try:
+                        # Handle numpy datetime/timedelta by converting to seconds
+                        if np.issubdtype(coords.dtype, np.datetime64) or np.issubdtype(
+                            coords.dtype, np.timedelta64
+                        ):
+                            scale = (coords[1] - coords[0]) / np.timedelta64(1, "s")
+                        else:
+                            scale = abs(float(coords[1] - coords[0]))
+                        dims_meta[f"scale_{db_suffix}"] = scale
+                    except (TypeError, IndexError):
+                        continue  # Skip if coordinates are not numeric or too short
+
+        # Extract channel names if they exist
+        if "C" in data.coords:
+            dims_meta["channels"] = [str(c) for c in data.coords["C"].values]
+
+        return dims_meta
+
     def scan_data_directory(
         self,
         extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"],
@@ -466,11 +564,10 @@ class ExperimentManager:
         """
         print(f"Scanning {self.data_dir} for new files...")
         conn = self._get_connection()
-        cursor = conn.cursor()
         found_new_files = 0
 
         try:
-            # 1. Find all potential container files
+            # Find all potential container files
             glob_iterators = (self.data_dir.glob(f"*{ext}") for ext in extensions)
             all_container_paths = chain.from_iterable(glob_iterators)
 
@@ -481,55 +578,11 @@ class ExperimentManager:
                     print(f"  Skipping hidden resource file: {container_path.name}")
                     continue
 
-                # FIX: Calculate relative path from the *data directory*
-                relative_path = container_path.relative_to(self.data_dir)
-
-                items_data_list = []
-
-                # If a parser is provided, it handles the logic for all files
-                if multi_file_parser:
-                    print(f"  Using parser to analyze file: {container_path.name}")
-                    # The parser decides if it's a single or multi-image container
-                    items_data_list = multi_file_parser(container_path)
-
-                # If no parser was used OR the parser returned an empty list (e.g., unrecognized file),
-                # default to treating the file as a single DataItem.
-                if not items_data_list:
-                    # Treat as a single-image file
-                    items_data_list.append(
-                        {
-                            "internal_index": "",  # Empty index for the file name only
-                            "metadata": {},
-                        }
-                    )
-
-                # 3. Process each sub-item extracted from the container/file
-                for item_data in items_data_list:
-                    internal_index = item_data.get("internal_index", "")
-
-                    # Create the DataItem and calculate the unique ID
-                    item = DataItem(relative_path, internal_index=internal_index)
-
-                    # Check if item (by its compound ID) already exists
-                    cursor.execute("SELECT id FROM items WHERE id = ?", (item.id,))
-                    if cursor.fetchone():
-                        continue
-
-                    # Add parsed metadata
-                    item.add_metadata(item_data.get("metadata", {}))
-
-                    # Insert new item into ITEMS table
-                    row = item.to_db_row()
-                    cursor.execute(
-                        """
-                        INSERT INTO items (id, relative_image_path, internal_index, metadata, processed, error)
-                        VALUES (:id, :relative_image_path, :internal_index, :metadata, :processed, :error)
-                    """,
-                        row,
-                    )
-
-                    found_new_files += 1
-                    print(f"  Registered new item: {item.id}")
+                # Delegate processing of each file to a helper method
+                new_items_count = self._process_container_file(
+                    container_path, conn, multi_file_parser
+                )
+                found_new_files += new_items_count
 
             conn.commit()
             if found_new_files > 0:
@@ -546,6 +599,101 @@ class ExperimentManager:
             conn.rollback()
         finally:
             conn.close()
+
+    def _create_item_in_db(self, conn: sqlite3.Connection, item: DataItem):
+        """Inserts a single DataItem into the database."""
+        row = item.to_db_row()
+        conn.execute(
+            """
+                        INSERT INTO items (id, relative_image_path, scene, metadata, processed, error,
+                                           size_t, size_c, size_z, size_y, size_x,
+                                           scale_t, scale_z, scale_y, scale_x, channels)
+                        VALUES (:id, :relative_image_path, :scene, :metadata, :processed, :error,
+                                :size_t, :size_c, :size_z, :size_y, :size_x,
+                                :scale_t, :scale_z, :scale_y, :scale_x,
+                                :channels)""",
+            row,
+        )
+        print(f"  Registered new item: {item.id}")
+
+    def _process_container_file(
+        self,
+        container_path: Path,
+        conn: sqlite3.Connection,
+        multi_file_parser: Optional[MultiFileParser],
+    ) -> int:
+        """Processes a single container file, creating and adding items to the DB."""
+        relative_path = container_path.relative_to(self.data_dir)
+        items_data_list = []
+        new_items_count = 0
+
+        # Use the provided parser or the default Reader to get scene information
+        if multi_file_parser:
+            print(f"  Using parser to analyze file: {container_path.name}")
+            items_data_list = multi_file_parser(container_path)
+        else:
+            try:
+                with Reader(container_path) as reader:
+                    for i, scene in enumerate(reader):
+                        items_data_list.append(
+                            {
+                                "scene": str(i),
+                                "_scene_xarray": scene,
+                            }
+                        )
+            except Exception as e:
+                print(f"  Could not read {container_path.name}: {e}")
+                return 0
+
+        # Process each sub-item (scene) from the file
+        for item_data in items_data_list:
+            item_id = item_data["_scene_xarray"].attrs["unique_id"]
+
+            if not item_id:
+                print(f"  Skipping scene in {relative_path} due to missing unique_id.")
+                continue
+
+            # Check if item already exists
+            if conn.execute("SELECT id FROM items WHERE id = ?", (item_id,)).fetchone():
+                continue
+
+            # Extract dimensional metadata
+            scene_xarray = item_data["_scene_xarray"]
+
+            if (
+                scene_xarray is None
+            ):  # Should not happen if ID was found, but for safety
+                try:
+                    with Reader(container_path) as reader:
+                        scene_xarray = next(
+                            (
+                                s
+                                for i, s in enumerate(reader)
+                                if str(i) == item_data["scene"]
+                            ),
+                            None,
+                        )
+                except Exception:
+                    scene_xarray = None
+
+            # Create the DataItem instance now that we have all info
+            item = DataItem(
+                id=item_id,
+                relative_image_path=relative_path,
+                scene=item_data.get("scene", ""),
+                # metadata=item_data.get("metadata", {}),
+            )
+            # add basi metadata on image size
+            if scene_xarray is not None:
+                dims_meta = self.extract_dims_from_xarray(scene_xarray)
+                for key, value in dims_meta.items():
+                    setattr(item, key, value)
+
+            # Add the fully formed item to the database
+            self._create_item_in_db(conn, item)
+            new_items_count += 1
+
+        return new_items_count
 
     def update_item(self, item: DataItem):
         """Update an item's record in the database.
@@ -566,11 +714,14 @@ class ExperimentManager:
             # 1. Update the main item row
             conn.execute(
                 """
-                UPDATE items SET 
-                    internal_index = :internal_index,
-                    metadata = :metadata, 
-                    processed = :processed, 
-                    error = :error
+                UPDATE items SET
+                    scene = :scene,
+                    metadata = :metadata,
+                    processed = :processed,
+                    error = :error,
+                    size_t = :size_t, size_c = :size_c, size_z = :size_z, size_y = :size_y, size_x = :size_x,
+                    scale_t = :scale_t, scale_z = :scale_z, scale_y = :scale_y, scale_x = :scale_x,
+                    channels = :channels
                 WHERE id = :id
             """,
                 row,
@@ -622,8 +773,8 @@ class ExperimentManager:
         except KeyError:
             return None
 
-    def get_internal_index(self, item_id: str) -> Optional[str]:
-        """Get the internal index for an item.
+    def get_scene(self, item_id: str) -> Optional[str]:
+        """Get the scene identifier for an item.
 
         Parameters
         ----------
@@ -633,11 +784,11 @@ class ExperimentManager:
         Returns
         -------
         Optional[str]
-            The internal index string, or `None` if the item is not found.
+            The scene identifier string, or `None` if the item is not found.
         """
         try:
             item = self.__getitem__(item_id)
-            return item.internal_index
+            return item.scene
         except KeyError:
             return None
 
@@ -730,22 +881,28 @@ class ExperimentManager:
             "SELECT * FROM items WHERE error IS NOT NULL AND processed = 0"
         )
 
+    def _update_item_status(self, where_clause: str = "1", message: str = ""):
+        """Generic helper to reset the status of items based on a WHERE clause."""
+        print(f"Updating item status in DB: {message}")
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                f"UPDATE items SET processed = 0, error = NULL WHERE {where_clause}"
+            )
+            conn.commit()
+            print(f"Reset status for {cursor.rowcount} items.")
+        except sqlite3.Error as e:
+            print(f"Database Reset Error: {e}")
+        finally:
+            conn.close()
+
     def force_reprocess_all(self):
         """Reset the 'processed' and 'error' status for all items.
 
         This method marks all items in the database as unprocessed, allowing
         them to be picked up again by a processing pipeline.
         """
-        print("Resetting 'processed' status for all items in the database.")
-        conn = self._get_connection()
-        try:
-            conn.execute("UPDATE items SET processed = 0, error = NULL")
-            conn.commit()
-            print(f"Reset status for {conn.total_changes} items.")
-        except sqlite3.Error as e:
-            print(f"Database Reset Error: {e}")
-        finally:
-            conn.close()
+        self._update_item_status(message="Resetting all items to unprocessed.")
 
     def reset_errors(self):
         """Reset the status for all items that previously failed.
@@ -753,19 +910,9 @@ class ExperimentManager:
         This method finds all items with a non-null `error` field and resets
         their `processed` and `error` statuses, allowing a re-attempt at processing.
         """
-        print("Resetting status for all items with errors in the database.")
-        conn = self._get_connection()
-        try:
-            # Resets all items where error is present (and processed is False)
-            conn.execute(
-                "UPDATE items SET processed = 0, error = NULL WHERE error IS NOT NULL"
-            )
-            conn.commit()
-            print(f"Reset status for {conn.total_changes} items.")
-        except sqlite3.Error as e:
-            print(f"Database Reset Error: {e}")
-        finally:
-            conn.close()
+        self._update_item_status(
+            where_clause="error IS NOT NULL", message="Resetting items with errors."
+        )
 
     def report_status(self):
         """Print a summary of the dataset's processing status."""
@@ -792,3 +939,9 @@ class ExperimentManager:
         print(f"Unprocessed:     {unprocessed_count}")
         print(f"With Errors:     {error_count}")
         print("---------------------------------------\n")
+
+    def to_dataframe(self):
+        """Export the experiment as a dataframe"""
+        import pandas as pd
+
+        return pd.DataFrame.from_records([x.to_db_row() for x in self.get_all_items()])
