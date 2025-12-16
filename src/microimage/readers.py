@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import itertools
 from typing import Dict, Any, List, Generator, Self, Iterator, Tuple
 from pathlib import Path
 import tifffile
@@ -394,6 +395,7 @@ class CZIReader(BaseReader):
         self.czi_context = pyczi.open_czi(path)
         self.czi = self.czi_context.__enter__()
         self.metadata = self.czi.metadata
+        self.to_numpy_dtype = {"Gray8": np.uint8, "Gray16": np.uint16}
 
     def __enter__(self) -> Self:
         return self
@@ -429,45 +431,103 @@ class CZIReader(BaseReader):
             A DataArray for each scene, with dimensions, coordinates, and metadata.
         """
 
-        num_scenes = len(self)
-        dims_shape = self.czi.get_dims_shape()[0]
+        num_scenes = len(self.czi.scenes_bounding_rectangle)
 
-        for scene_index in range(num_scenes):
-            # Define the dimensions for reading this specific scene
-            selector = {"S": scene_index}
+        # compute the shape as a dictionary
+        shape = {
+            x: self.czi.total_bounding_box[x][1] - self.czi.total_bounding_box[x][0]
+            for x in self.czi.total_bounding_box
+        }
 
-            # LAZY LOADING: Wrap the read operation in dask.delayed.
-            # This creates a lazy dask array that only reads data when computed.
-            lazy_read = dask.delayed(self.czi.read_image)(**selector)
+        # remove singleton axes
+        shape = {k: v for k, v in shape.items() if v > 1}
 
-            # The shape and dtype must be known ahead of time for dask.
-            # We need to get the shape *after* applying the selector for 'S'
-            # and then removing 'S' from the dimensions for the scene.
-            dims_shape_dict, all_dims = self.czi.get_dims_shape()
-            shape_for_scene = tuple(dims_shape_dict[d][1] for d in all_dims if d != "S")
-            dtype = self.czi.pixel_type.to_numpy_dtype()
+        # remove YX
+        dims = {k: v for k, v in shape.items() if (k != "X" and k != "Y")}
 
-            data = da.from_delayed(lazy_read, shape=shape_for_scene, dtype=dtype)
-            dims = [d for d in all_dims if d != "S"]
+        # insure the YX order
+        shape = dims | {"Y": shape["Y"], "X": shape["X"]}
 
-            # --- Build Coordinates ---
+        # Get the dimension keys and their corresponding ranges of indices
+        dim_keys = list(dims.keys())
+        index_ranges = [range(size) for size in dims.values()]
+
+        # Use itertools.product to get all combinations of indices
+        index_combinations = itertools.product(*index_ranges)
+
+        # Create the list of dictionaries directly from the index combinations
+        planes = [dict(zip(dim_keys, indices)) for indices in index_combinations]
+
+        # Compute the coordinates
+        distances = self.czi.metadata["ImageDocument"]["Metadata"]["Scaling"]["Items"][
+            "Distance"
+        ]
+
+        scales = {d["@Id"]: float(d["Value"]) for d in distances}
+
+        if num_scenes == 0:
+            data = da.stack(
+                [
+                    da.from_delayed(
+                        dask.delayed(self.czi.read)(plane, pixel_type="Gray16"),
+                        shape=[shape["Y"], shape["X"]],
+                        dtype=np.uint16,
+                    )
+                    for plane in planes
+                ]
+            ).reshape([shape[k] for k in shape])
+
             coords = {}
-            # Get scale and unit for each dimension
-            for dim in dims:
-                if dim in dims_shape:
-                    size = dims_shape[dim][1]
-                    scale = self.czi.get_dimension_pixel_size(dim)
-                    if scale:
-                        coords[dim] = np.arange(size) * scale
+            for dim in shape:
+                if dim in scales.keys():
+                    coords[dim] = np.arange(shape[dim]) * scales[dim]
+                else:
+                    coords[dim] = np.arange(shape[dim])
 
-            # Special handling for channel names
-            if "C" in dims and self.czi.channel_names:
-                coords["C"] = self.czi.channel_names
+            attrs = self.czi.metadata["ImageDocument"]["Metadata"]
+            attrs["unique_id"] = generate_scene_id(self.path, 0)
 
-            # Create and yield the DataArray
-            scene_id = generate_scene_id(self.path, scene_index)
-            scene_attrs = {**self.metadata, "unique_id": scene_id}
-            yield xr.DataArray(data, dims=dims, coords=coords, attrs=scene_attrs)
+            yield xr.DataArray(
+                data,
+                coords=coords,
+                attrs=attrs,
+            )
+
+        else:
+            for scene_index in range(num_scenes):
+                scene_shape = shape.copy()
+                scene_shape["Y"] = self.czi.scenes_bounding_rectangle[scene_index].h
+                scene_shape["X"] = self.czi.scenes_bounding_rectangle[scene_index].w
+
+                data = da.stack(
+                    [
+                        da.from_delayed(
+                            dask.delayed(self.czi.read)(
+                                plane,
+                                scene=scene_index,
+                            ),
+                            shape=[scene_shape["Y"], scene_shape["X"]],
+                            dtype=np.uint16,
+                        )
+                        for plane in planes
+                    ]
+                ).reshape([scene_shape[k] for k in scene_shape])
+
+                coords = {}
+                for dim in scene_shape:
+                    if dim in scales.keys():
+                        coords[dim] = np.arange(scene_shape[dim]) * scales[dim]
+                    else:
+                        coords[dim] = np.arange(scene_shape[dim])
+
+                attrs = self.czi.metadata["ImageDocument"]["Metadata"]
+                attrs["unique_id"] = generate_scene_id(self.path, scene_index)
+
+                yield xr.DataArray(
+                    data,
+                    coords=coords,
+                    attrs=attrs,
+                )
 
 
 READER_REGISTRY[".czi"] = CZIReader
@@ -594,6 +654,10 @@ class LIFReader(BaseReader):
             A lazy-loaded DataArray for each series, with dimensions,
             coordinates, and metadata.
         """
+        for scene_index, scene in enumerate(self.lif.images):
+            name = scene.name
+            data = lif.images[name].asxarray()
+
         for i, series in enumerate(self.lif.series):
             # Use dask=True for lazy loading
             data = series.asarray(dask=True)

@@ -541,6 +541,22 @@ class ExperimentManager:
 
         return dims_meta
 
+    def add_file(self, file_path: Path | str, metadata: dict[Any]):
+        """Add a single image container
+
+        Note the file as to in the project folder... is this good?
+
+        Parameters
+        ----------
+        file_path: str | Path
+            Path to the
+        metadata: dictionnary
+            Additional metadata as a dictionnary
+
+        """
+
+        pass
+
     def scan_data_directory(
         self,
         extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"],
@@ -555,7 +571,7 @@ class ExperimentManager:
         Parameters
         ----------
         extensions : List[str], optional
-            A list of file extensions to look for, by default [".png", ".jpg", ".jpeg", ".tif"].
+            A list of file extensions to look for, by default [".lsm", ".nd2", ".czi", ".lif"].
         multi_file_parser : MultiFileParser, optional
             A callable that takes a file `Path` and returns a list of dicts,
             one for each sub-item (e.g., scene) in the file. If not provided,
