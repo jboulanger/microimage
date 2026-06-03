@@ -2,7 +2,7 @@
 
 This project aims at factoring code that is used repetitively when developing workflows for the analysis of light microscopy image.
 
-It is composed of a dataset management, unified image reader that decode basic metadata to xarray and basic batch processing.
+It is composed of a dataset management, unified image readers and writers working with xarray and basic batch processing.
 
 ## Installation
 
@@ -54,5 +54,18 @@ configured_worker_task = partial(
     db_path=db_path)
 
 ```
+
+## Supported file formats
+
+| Format | Read | Write |
+|--------|------|-------|
+| TIF    | yes  |       |
+| LSM    | yes  |       |
+| CZI    | yes  |       |
+| ND2    | yes  |       |
+| LIF    | yes  |       |
+| VSI    | yes  |       |
+| IMS    | yes  |       |
+| NGFF   |      |       |     
 
 

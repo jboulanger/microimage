@@ -1,12 +1,13 @@
 import sqlite3
 import json
 import os
-from typing import List, Dict, Any, Optional, Union, Iterator, Tuple, Callable
+from typing import List, Dict, Any, Optional, Union, Iterator, Callable, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field
 from itertools import chain
 import xarray as xr
 import numpy as np
+import yaml
 
 from .readers import Reader
 
@@ -24,6 +25,11 @@ def dict_factory(cursor, row):
         The cursor object from which the row was fetched.
     row : tuple
         The raw tuple row fetched from the database.
+
+    Returns
+    -------
+    dict
+        Dictionnary with content of the row
 
     """
     d = {}
@@ -51,7 +57,7 @@ class DataItem:
 
     Parameters
     ----------
-    relative_image_path : Path
+    relative_path : Path
         The path to the container file, relative to the `ExperimentManager`'s
         `data_dir`.
     scene : str, optional
@@ -71,11 +77,10 @@ class DataItem:
     id : str
         The unique identifier for the item, derived from the container name
         and internal index (e.g., "image.czi:0").
-
     """
 
     # Required field, points to the container file
-    relative_image_path: Path
+    relative_path: Path
 
     # The unique, hash-based identifier for this item.
     id: str
@@ -83,7 +88,7 @@ class DataItem:
     # Fields with default values
     scene: str = field(default="")  # The original scene index (e.g., "0", "1")
     metadata: Dict[str, Any] = field(default_factory=dict)  # noqa
-    # This remains a Dict[type: path] in memory, but is stored in a separate DB table.
+    # This remains a Dict[type: path] in memory, but is stored in a separate DB table ('results').
     # NOTE: Result paths are stored relative to ExperimentManager's project_root (DB parent).
     result_files: Dict[str, str] = field(default_factory=dict)
     processed: bool = field(default=False)
@@ -100,6 +105,10 @@ class DataItem:
     scale_x: Optional[float] = field(default=None)
     channels: Optional[List[str]] = field(default=None)
 
+    # Annotated metadata from 'annotations' table
+    condition: Optional[str] = field(default=None)
+    annotated_channels: Optional[List[str]] = field(default=None)
+
     error: Optional[str] = field(default=None)
 
     def add_metadata(self, metadata_dict: Dict[str, Any]):
@@ -113,18 +122,18 @@ class DataItem:
         """
         self.metadata.update(metadata_dict)
 
-    def add_result_file(self, result_type: str, relative_file_path: str):
+    def add_result_file(self, result_type: str, relative_path: str):
         """Register a new result file for this item.
 
         Parameters
         ----------
         result_type : str
             A string identifying the type of result (e.g., "thumbnail", "mask").
-        relative_file_path : str
+        relative_path : str
             The path to the result file, relative to the project root.
 
         """
-        self.result_files[result_type] = relative_file_path
+        self.result_files[result_type] = relative_path
 
     def get_absolute_container_path(self, base_data_dir: Path) -> Path:
         """Return the absolute path to the item's container file.
@@ -133,15 +142,14 @@ class DataItem:
         ----------
         base_data_dir : Path
             The absolute path to the main data directory, which serves as the
-            base for the item's `relative_image_path`.
+            base for the item's `relative_path`.
 
         Returns
         -------
         Path
             The resolved, absolute path to the container file.
-
         """
-        return (base_data_dir / self.relative_image_path).resolve()
+        return (base_data_dir / self.relative_path).resolve()
 
     def get_full_id(self) -> str:
         """Return the unique ID for this DataItem.
@@ -153,21 +161,19 @@ class DataItem:
         """
         return self.id
 
-    def to_db_row(self) -> Dict[str, Any]:
+    def to_data_row(self) -> Dict[str, Any]:
         """
         Converts the DataItem object into a dictionary suitable for DB insertion/update
-        for the 'items' table (excluding result_files).
-        """
-        """Convert the DataItem to a dictionary for database storage.
+        for the 'data' table (excluding result data).
 
         Returns
         -------
         Dict[str, Any]
-            A dictionary representation of the item for the 'items' table.
+            A dictionary representation of the item for the 'data' table.
         """
         return {
             "id": self.id,
-            "relative_image_path": str(self.relative_image_path),
+            "relative_path": str(self.relative_path),
             "scene": self.scene,
             "metadata": json.dumps(self.metadata),
             "processed": int(self.processed),
@@ -184,6 +190,10 @@ class DataItem:
             "channels": json.dumps(self.channels)
             if self.channels is not None
             else None,
+            "condition": self.condition,
+            "annotated_channels": json.dumps(self.annotated_channels)
+            if self.annotated_channels is not None
+            else None,
         }
 
     @classmethod
@@ -195,7 +205,7 @@ class DataItem:
         Parameters
         ----------
         data : Dict[str, Any]
-            A dictionary representing a row from the 'items' table.
+            A dictionary representing a row from the 'data' table.
         result_files : Optional[Dict[str, str]], optional
             A dictionary of result files for this item, by default None.
 
@@ -203,18 +213,17 @@ class DataItem:
         -------
         DataItem
             A fully hydrated DataItem instance.
-
         """
-        relative_path_str = data.get("relative_image_path")
+        relative_path_str = data.get("relative_path")
         if relative_path_str is None:
-            raise ValueError("Database row missing 'relative_image_path' key.")
+            raise ValueError("Database row missing 'relative_path' key.")
 
         item_id = data.get("id")
         if not item_id:
             raise ValueError("Database row missing 'id' key.")
 
         scene = data.get("scene", "")
-        item = cls(id=item_id, relative_image_path=Path(relative_path_str), scene=scene)
+        item = cls(id=item_id, relative_path=Path(relative_path_str), scene=scene)
 
         # Hydrate the rest of the fields
         item.metadata = json.loads(data.get("metadata", "{}") or "{}")
@@ -236,6 +245,12 @@ class DataItem:
         channels_json = data.get("channels")
         if channels_json:
             item.channels = json.loads(channels_json)
+
+        # Hydrate annotations from JOIN
+        item.condition = data.get("condition")
+        ann_channels_json = data.get("annotated_channels")
+        if ann_channels_json:
+            item.annotated_channels = json.loads(ann_channels_json)
 
         if result_files:
             item.result_files = result_files
@@ -333,11 +348,11 @@ class ExperimentManager:
         print(f"Initializing database at {self.db_path}...")
         conn = self._get_connection()
         try:
-            # Table for main item data
+            # Table for main data
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS items (
+                CREATE TABLE IF NOT EXISTS data (
                     id TEXT PRIMARY KEY,
-                    relative_image_path TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
                     scene TEXT NOT NULL,
                     metadata TEXT,
                     processed INTEGER NOT NULL,
@@ -355,14 +370,24 @@ class ExperimentManager:
                 )
             """)
 
-            # Table for one-to-many result files relationship
+            # Table for one-to-many results relationship
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS result_files (
-                    item_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS results (
+                    data_id TEXT NOT NULL,
                     result_type TEXT NOT NULL,
-                    relative_file_path TEXT NOT NULL,
-                    PRIMARY KEY (item_id, result_type),
-                    FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+                    relative_path TEXT NOT NULL,
+                    PRIMARY KEY (data_id, result_type),
+                    FOREIGN KEY (data_id) REFERENCES data(id) ON DELETE CASCADE
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS annotations (
+                    data_id TEXT NOT NULL,
+                    channels TEXT NOT NULL,
+                    condition TEXT NOT NULL,
+                    PRIMARY KEY (data_id),
+                    FOREIGN KEY (data_id) REFERENCES data(id) ON DELETE CASCADE
                 )
             """)
             conn.commit()
@@ -390,13 +415,11 @@ class ExperimentManager:
             A dictionary mapping result type to relative file path.
         """
         cursor = conn.execute(
-            "SELECT result_type, relative_file_path FROM result_files WHERE item_id = ?",
+            "SELECT result_type, relative_path FROM results WHERE data_id = ?",
             (item_id,),
         )
         # Convert list of rows (type, path) to a dictionary {type: path}
-        return {
-            row["result_type"]: row["relative_file_path"] for row in cursor.fetchall()
-        }
+        return {row["result_type"]: row["relative_path"] for row in cursor.fetchall()}
 
     def _fetch_item_with_results(
         self, conn: sqlite3.Connection, item_id: str
@@ -415,7 +438,15 @@ class ExperimentManager:
         Optional[DataItem]
             A `DataItem` instance if found, otherwise None.
         """
-        cursor = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,))
+        cursor = conn.execute(
+            """
+            SELECT d.*, a.condition, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+            WHERE d.id = ?
+        """,
+            (item_id,),
+        )
         item_row = cursor.fetchone()
 
         if not item_row:
@@ -468,7 +499,7 @@ class ExperimentManager:
         """
         conn = self._get_connection()
         try:
-            count = conn.execute("SELECT COUNT(id) FROM items").fetchone()["COUNT(id)"]
+            count = conn.execute("SELECT COUNT(id) FROM data").fetchone()["COUNT(id)"]
             return count
         except sqlite3.Error as e:
             print(f"Database Count Error: {e}")
@@ -618,13 +649,13 @@ class ExperimentManager:
 
     def _create_item_in_db(self, conn: sqlite3.Connection, item: DataItem):
         """Inserts a single DataItem into the database."""
-        row = item.to_db_row()
+        row = item.to_data_row()
         conn.execute(
             """
-                        INSERT INTO items (id, relative_image_path, scene, metadata, processed, error,
+                        INSERT INTO data (id, relative_path, scene, metadata, processed, error,
                                            size_t, size_c, size_z, size_y, size_x,
                                            scale_t, scale_z, scale_y, scale_x, channels)
-                        VALUES (:id, :relative_image_path, :scene, :metadata, :processed, :error,
+                        VALUES (:id, :relative_path, :scene, :metadata, :processed, :error,
                                 :size_t, :size_c, :size_z, :size_y, :size_x,
                                 :scale_t, :scale_z, :scale_y, :scale_x,
                                 :channels)""",
@@ -651,6 +682,7 @@ class ExperimentManager:
             try:
                 with Reader(container_path) as reader:
                     for i, scene in enumerate(reader):
+                        print(f"Adding {container_path} scene [{i}]")
                         items_data_list.append(
                             {
                                 "scene": str(i),
@@ -670,7 +702,7 @@ class ExperimentManager:
                 continue
 
             # Check if item already exists
-            if conn.execute("SELECT id FROM items WHERE id = ?", (item_id,)).fetchone():
+            if conn.execute("SELECT id FROM data WHERE id = ?", (item_id,)).fetchone():
                 continue
 
             # Extract dimensional metadata
@@ -695,11 +727,11 @@ class ExperimentManager:
             # Create the DataItem instance now that we have all info
             item = DataItem(
                 id=item_id,
-                relative_image_path=relative_path,
+                relative_path=relative_path,
                 scene=item_data.get("scene", ""),
                 # metadata=item_data.get("metadata", {}),
             )
-            # add basi metadata on image size
+            # add base metadata on image size
             if scene_xarray is not None:
                 dims_meta = self.extract_dims_from_xarray(scene_xarray)
                 for key, value in dims_meta.items():
@@ -726,11 +758,11 @@ class ExperimentManager:
         """
         conn = self._get_connection()
         try:
-            row = item.to_db_row()
+            row = item.to_data_row()
             # 1. Update the main item row
             conn.execute(
                 """
-                UPDATE items SET
+                UPDATE data SET
                     scene = :scene,
                     metadata = :metadata,
                     processed = :processed,
@@ -744,7 +776,7 @@ class ExperimentManager:
             )
 
             # 2. Delete existing result files for this item
-            conn.execute("DELETE FROM result_files WHERE item_id = ?", (item.id,))
+            conn.execute("DELETE FROM results WHERE data_id = ?", (item.id,))
 
             # 3. Insert the current set of result files
             if item.result_files:
@@ -754,12 +786,60 @@ class ExperimentManager:
                 ]
                 conn.executemany(
                     """
-                    INSERT INTO result_files (item_id, result_type, relative_file_path)
+                    INSERT INTO results (data_id, result_type, relative_path)
                     VALUES (?, ?, ?)
                 """,
                     result_data,
                 )
 
+            # 4. Update annotations
+            # Fetch existing annotations if any
+            existing_annotation = conn.execute(
+                "SELECT condition, channels FROM annotations WHERE data_id = ?",
+                (item.id,),
+            ).fetchone()
+
+            current_condition = (
+                existing_annotation["condition"] if existing_annotation else None
+            )
+            current_annotated_channels_json = (
+                existing_annotation["channels"] if existing_annotation else None
+            )
+            current_annotated_channels = (
+                json.loads(current_annotated_channels_json)
+                if current_annotated_channels_json
+                else None
+            )
+
+            # Determine the values to be used for the update
+            # If item has a value, use it. Otherwise, retain the existing value.
+            new_condition = (
+                item.condition if item.condition is not None else current_condition
+            )
+            new_annotated_channels = (
+                item.annotated_channels
+                if item.annotated_channels is not None
+                else current_annotated_channels
+            )
+
+            # Only proceed if there's something to insert/update for annotations
+            if new_condition is not None or new_annotated_channels is not None:
+                conn.execute(
+                    """
+                    INSERT INTO annotations (data_id, condition, channels)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(data_id) DO UPDATE SET
+                        condition=excluded.condition,
+                        channels=excluded.channels
+                """,
+                    (
+                        item.id,
+                        new_condition,
+                        json.dumps(new_annotated_channels)
+                        if new_annotated_channels is not None
+                        else None,
+                    ),
+                )
             conn.commit()
         except sqlite3.Error as e:
             print(f"Database Update Error for {item.id}: {e}")
@@ -837,9 +917,9 @@ class ExperimentManager:
             id_placeholders = ",".join(["?"] * len(item_ids))
             result_rows = conn.execute(
                 f"""
-                SELECT item_id, result_type, relative_file_path 
-                FROM result_files 
-                WHERE item_id IN ({id_placeholders})
+                SELECT data_id, result_type, relative_path 
+                FROM results 
+                WHERE data_id IN ({id_placeholders})
             """,
                 item_ids,
             ).fetchall()
@@ -849,9 +929,7 @@ class ExperimentManager:
                 item_id: {} for item_id in item_ids
             }
             for row in result_rows:
-                all_results[row["item_id"]][row["result_type"]] = row[
-                    "relative_file_path"
-                ]
+                all_results[row["data_id"]][row["result_type"]] = row["relative_path"]
 
             # 4. Create and return DataItem objects
             return [
@@ -871,7 +949,13 @@ class ExperimentManager:
         List[DataItem]
             A list containing every `DataItem` in the database.
         """
-        return self._bulk_fetch_items("SELECT * FROM items")
+        return self._bulk_fetch_items(
+            """
+            SELECT d.*, a.condition, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+        """
+        )
 
     def get_unprocessed_items(self) -> List[DataItem]:
         """Return a list of all items not yet marked as processed.
@@ -882,7 +966,14 @@ class ExperimentManager:
             A list of all `DataItem` objects where `processed` is False.
         """
         # processed = 0 (False)
-        return self._bulk_fetch_items("SELECT * FROM items WHERE processed = 0")
+        return self._bulk_fetch_items(
+            """
+            SELECT d.*, a.condition, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+            WHERE d.processed = 0
+        """
+        )
 
     def get_items_with_errors(self) -> List[DataItem]:
         """Return a list of all items that have a recorded error.
@@ -894,7 +985,12 @@ class ExperimentManager:
         """
         # error IS NOT NULL and processed = 0
         return self._bulk_fetch_items(
-            "SELECT * FROM items WHERE error IS NOT NULL AND processed = 0"
+            """
+            SELECT d.*, a.condition, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+            WHERE d.error IS NOT NULL AND d.processed = 0
+        """
         )
 
     def _update_item_status(self, where_clause: str = "1", message: str = ""):
@@ -903,7 +999,7 @@ class ExperimentManager:
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                f"UPDATE items SET processed = 0, error = NULL WHERE {where_clause}"
+                f"UPDATE data SET processed = 0, error = NULL WHERE {where_clause}"
             )
             conn.commit()
             print(f"Reset status for {cursor.rowcount} items.")
@@ -936,10 +1032,10 @@ class ExperimentManager:
         conn = self._get_connection()
         try:
             processed_count = conn.execute(
-                "SELECT COUNT(id) FROM items WHERE processed = 1"
+                "SELECT COUNT(id) FROM data WHERE processed = 1"
             ).fetchone()["COUNT(id)"]
             error_count = conn.execute(
-                "SELECT COUNT(id) FROM items WHERE error IS NOT NULL"
+                "SELECT COUNT(id) FROM data WHERE error IS NOT NULL"
             ).fetchone()["COUNT(id)"]
         except sqlite3.Error as e:
             print(f"Database Report Error: {e}")
@@ -957,7 +1053,162 @@ class ExperimentManager:
         print("---------------------------------------\n")
 
     def to_dataframe(self):
-        """Export the experiment as a dataframe"""
+        """Export the experiment as a dataframe
+        Returns
+        -------
+        pd.DataFrame
+            The list of files as a dataframe
+        """
         import pandas as pd
 
-        return pd.DataFrame.from_records([x.to_db_row() for x in self.get_all_items()])
+        return pd.DataFrame.from_records(
+            [x.to_data_row() for x in self.get_all_items()]
+        )
+
+    def to_dict_for_annotation(self):
+        """Export the list of data to a dictionnary for proof-reading and annotation of channel and conditions
+
+        The dataset is split into consistent groups based on the content of the "channels" field.
+        The list of files also contains the serie index.
+
+        Returns
+        -------
+        dict
+            Dictionnary with {set:{"channels":, "condition":, "files"}}
+        """
+        df = self.to_dataframe()
+        return {
+            f"set{k}": {
+                "channels": ng[0],
+                "condition": "unknown",
+                "files": ng[1]["relative_path"].unique().tolist(),
+            }
+            for k, ng in enumerate(df.groupby("channels"))
+        }
+
+    def save_dict_for_annotation(self, filepath):
+        """Save the data table to a yaml for user annotation
+
+        Parameters
+        ----------
+        filepath: Path | str
+            Path where to save the file
+        """
+
+        data = self.to_dict_for_annotation()
+        with open(filepath, "w") as f:
+            yaml.dump(data, f)
+
+    def update_annotation(self, filepath):
+        """Load user annotations and populate/update the annotation table
+
+        Parameters
+        ----------
+        filepath: Path | str
+            Path where to save the file
+
+        """
+        # Load the annotation from a yml file
+        with open(filepath, "r") as f:
+            data = yaml.safe_load(f)
+
+        # Group items by their relative path for efficient updates
+        all_items = self.get_all_items()
+        items_by_path: Dict[str, List[DataItem]] = {}
+        for item in all_items:
+            path_str = str(item.relative_path)
+            items_by_path.setdefault(path_str, []).append(item)
+
+        # Update items using the information from the annotation dictionary
+        for s in data:
+            condition = data[s]["condition"]
+            channels = data[s]["channels"]
+
+            # Ensure channels is handled as a list/object (it may be JSON string in the YAML)
+            if isinstance(channels, str):
+                try:
+                    channels = json.loads(channels)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Update each file found in the set
+            for rel_path in data[s].get("files", []):
+                if rel_path in items_by_path:
+                    affected_items = items_by_path[rel_path]
+                    for item in affected_items:
+                        item.condition = condition
+                        item.annotated_channels = channels
+                        self.update_item(item)
+                    print(
+                        f"Updated annotations for {len(affected_items)} items in {rel_path}."
+                    )
+
+    def load_item_data(self, item: DataItem) -> xr.DataArray:
+        """Load the image data for a DataItem and apply annotations.
+
+        This method uses the appropriate Reader to load the specific scene,
+        and then maps the `annotated_channels` and `condition` to the
+        resulting xarray object if they exist.
+
+        Parameters
+        ----------
+        item : DataItem
+            The item to load data for.
+
+        Returns
+        -------
+        xr.DataArray
+            A dask-backed xarray containing the image data and updated metadata.
+
+        Raises
+        ------
+        ValueError
+            If the specified scene cannot be found in the container file.
+        """
+        abs_path = self.get_absolute_container_path(item.id)
+        if abs_path is None:
+            raise FileNotFoundError(f"Container path not found for item: {item.id}")
+
+        # Scenes are stored as strings (e.g., "0"), but readers iterate by integer index
+        scene_idx = int(item.scene) if item.scene.isdigit() else 0
+
+        # To ensure dask arrays remain functional after this method returns, we avoid
+        # using a context manager here. Many microscopy readers (CZI, ND2, LSM)
+        # require the underlying file handle to remain open for lazy loading.
+        reader = Reader(abs_path)
+        data = None
+        for i, scene in enumerate(reader):
+            if i == scene_idx:
+                data = scene
+                break
+
+        if data is None:
+            raise ValueError(f"Scene {item.scene} not found in {abs_path}")
+
+        # Attach the reader instance to the xarray to keep its lifecycle tied
+        # to the data, preventing premature garbage collection and file closing.
+        data.attrs["_reader"] = reader
+
+        # Apply annotated channel names if they exist and match the count
+        if item.annotated_channels:
+            if "C" in data.dims and len(item.annotated_channels) == data.sizes["C"]:
+                data.coords["C"] = item.annotated_channels
+            else:
+                print(f"Warning: Annotation channel count mismatch for {item.id}")
+
+        # Attach condition to attributes
+        if item.condition:
+            data.attrs["condition"] = item.condition
+
+        return data
+
+    def iter_data(self) -> Iterator[Tuple[DataItem, xr.DataArray]]:
+        """Yields each DataItem and its associated xarray data.
+
+        Yields
+        ------
+        Iterator[Tuple[DataItem, xr.DataArray]]
+            A tuple of (DataItem, xr.DataArray).
+        """
+        for item in self.get_all_items():
+            yield item, self.load_item_data(item)

@@ -156,8 +156,31 @@ def mock_czi_file():
     all_dims = "SZCYX"
     mock_czi.get_dims_shape.return_value = (dims_shape_dict, all_dims)
 
+    # --- Mock Scenes Bounding Rectangle ---
+    # This must match the 'S' dimension size (2) for consistency.
+    mock_scene_rect = MagicMock()
+    mock_scene_rect.h = 64
+    mock_scene_rect.w = 64
+    mock_czi.scenes_bounding_rectangle = [mock_scene_rect, mock_scene_rect]
+
     # --- Mock Metadata ---
-    mock_czi.metadata = {"Experiment": "Test1", "Sample": "CellCulture"}
+    mock_czi.metadata = {
+        "ImageDocument": {
+            "Metadata": {
+                "Experiment": "Test1",
+                "Sample": "CellCulture",
+                "Scaling": {
+                    "Items": {
+                        "Distance": [
+                            {"@Id": "X", "Value": 0.1},
+                            {"@Id": "Y", "Value": 0.1},
+                            {"@Id": "Z", "Value": 0.5},
+                        ]
+                    }
+                },
+            }
+        }
+    }
     mock_czi.channel_names = ["DAPI", "GFP", "mCherry"]
     mock_czi.get_dimension_pixel_size.side_effect = lambda dim: {
         "Z": 0.5,
@@ -237,7 +260,7 @@ def mock_nd2_file():
 
 def test_nd2_reader_multi_position(mock_nd2_file):
     """Verify ND2Reader correctly iterates through positions."""
-    dummy_path = Path("test.nd2")
+    dummy_path = Path("../data/WellA01_Seq0000.nd2")
     with patch("nd2.ND2File", return_value=mock_nd2_file):
         with Reader(dummy_path) as reader:
             assert isinstance(reader, ND2Reader)
