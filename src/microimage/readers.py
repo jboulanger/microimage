@@ -84,7 +84,7 @@ class BaseReader(ABC):
         pass
 
     def __iter__(self) -> Iterator[xr.DataArray]:
-        return self.iter_scenes()
+        return self.iter_scenes_normalized()
 
     @abstractmethod
     def __len__(self) -> int:
@@ -97,6 +97,34 @@ class BaseReader(ABC):
 
         """
         pass
+
+    def iter_scenes_normalized(self) -> Generator[xr.DataArray, None, None]:
+        """Yield each scene with dimensions normalized to (T, C, Z, Y, X).
+
+        This method wraps `iter_scenes`, reordering and expanding dimensions
+        as necessary to ensure a consistent 5D output format (T, C, Z, Y, X).
+        Missing dimensions are added as singletons.
+
+        Yields
+        ------
+        xr.DataArray
+            An xarray DataArray with dimensions (T, C, Z, Y, X).
+        """
+        target_dims = ("T", "C", "Z", "Y", "X")
+        for scene in self.iter_scenes():
+            # Standardize time dimension naming if 'time' is used instead of 'T'
+            if "time" in scene.dims:
+                scene = scene.rename({"time": "T"})
+
+            # Identify and add missing dimensions as singletons
+            missing_dims = [d for d in target_dims if d not in scene.dims]
+            if missing_dims:
+                scene = scene.expand_dims({d: 1 for d in missing_dims})
+
+            # Reorder dimensions to the standard (T, C, Z, Y, X)
+            # Any unexpected extra dimensions are appended after the target ones.
+            order = list(target_dims) + [d for d in scene.dims if d not in target_dims]
+            yield scene.transpose(*order)
 
     @abstractmethod
     def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
