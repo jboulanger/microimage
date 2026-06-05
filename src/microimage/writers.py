@@ -1,8 +1,9 @@
-from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Generator, Self, Iterator, Tuple
-import xarray as xr
+from pathlib import Path
+from typing import Generator, Iterator, Self
+
 import tifffile
+import xarray as xr
 
 
 class BaseWriter(ABC):

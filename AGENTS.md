@@ -11,6 +11,11 @@ Python file management tool high-throughput microscopy pipelines where standardi
 - examples — use cases notebooks and example scripts
 
 ## Important Constraints
+- Write code that is straightforward to read and understand, prioritizing clarity
+- Only build features that are required right now 
+- Break the code into decoupled, cohesive components
+
+## Tooling
 - use ruff for code formating
 - use uv for managing environment
 - use pytest for testing

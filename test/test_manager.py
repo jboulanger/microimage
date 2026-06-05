@@ -1,10 +1,11 @@
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
-import xarray as xr
-import numpy as np
+from unittest.mock import MagicMock, patch
 
-from microimage import ExperimentManager, MetadataParser, DataItem
+import numpy as np
+import pytest
+import xarray as xr
+
+from microimage import DataItem, ExperimentManager, MetadataParser
 
 
 @pytest.fixture

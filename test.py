@@ -1,10 +1,7 @@
-import os
 import shutil
 from pathlib import Path
-from microimage import Reader, ExperimentManager
-from pylibCZIrw import czi as pyczi
-import dask.array as da
 
+from microimage import ExperimentManager, Reader
 
 filename = "/media/cephfs/sankar/Images for Jerome/SunTag images/111125_GFP 488_PCNT 647_SunBicD2 FL CCmut new_1.czi"
 filename = "/home/jeromeb/Downloads/w96_A1+A2.czi"

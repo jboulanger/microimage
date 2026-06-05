@@ -1,6 +1,12 @@
-from .manager import ExperimentManager, DataItem
-from .readers import Reader, MetadataParser
-from .writers import Writer
+"""Microimage package."""
 
+from .manager import DataItem, ExperimentManager
+from .processor import apply
+from .readers import Reader
 
-__all__ = ["ExperimentManager", "Reader", "MetadataParser", "Writer", "DataItem"]
+__all__ = [
+    "DataItem",
+    "ExperimentManager",
+    "Reader",
+    "apply",
+]

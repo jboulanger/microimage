@@ -19,3 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+
+[tool.ruff]
+select = ["E", "F", "W", "I", "D"]
+
+[tool.ruff.pydocstyle]
+convention = "numpy"

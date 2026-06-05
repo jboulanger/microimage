@@ -1,12 +1,15 @@
-import sqlite3
+"""Manager from microscopy experiments."""
+
 import json
 import os
-from typing import List, Dict, Any, Optional, Union, Iterator, Callable, Tuple
-from pathlib import Path
+import sqlite3
 from dataclasses import dataclass, field
 from itertools import chain
-import xarray as xr
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+
 import numpy as np
+import xarray as xr
 import yaml
 
 from .readers import Reader
@@ -14,7 +17,7 @@ from .readers import Reader
 
 # Custom connection factory to return dictionary rows instead of tuples
 def dict_factory(cursor, row):
-    """Converts SQLite tuple row results into a dictionary.
+    """Convert SQLite tuple row results into a dictionary.
 
     This function is used as a `row_factory` for an sqlite3 connection
     to make query results more intuitive to access by column name.
@@ -38,7 +41,8 @@ def dict_factory(cursor, row):
     return d
 
 
-# Type hint for the new parser function: takes a Path and returns a list of sub-item data dictionaries.
+# Type hint for the new parser function: takes a Path and returns a list of sub-item
+# data dictionaries.
 # Each dictionary MUST contain at least 'internal_index' and 'metadata'.
 MultiFileParser = Callable[
     [Path], List[Dict[str, Any]]
@@ -162,7 +166,8 @@ class DataItem:
         return self.id
 
     def to_data_row(self) -> Dict[str, Any]:
-        """
+        """Convert the DataItem object into a dictionary.
+
         Converts the DataItem object into a dictionary suitable for DB insertion/update
         for the 'data' table (excluding result data).
 
@@ -340,6 +345,7 @@ class ExperimentManager:
         conn = sqlite3.connect(
             self.db_path, timeout=10.0
         )  # Set a high timeout for concurrency
+        conn.execute("PRAGMA synchronous=NORMAL;")
         conn.row_factory = dict_factory
         return conn
 
@@ -348,6 +354,9 @@ class ExperimentManager:
         print(f"Initializing database at {self.db_path}...")
         conn = self._get_connection()
         try:
+            # Enable WAL mode for better concurrency
+            conn.execute("PRAGMA journal_mode=WAL;")
+
             # Table for main data
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS data (
@@ -521,7 +530,7 @@ class ExperimentManager:
     # --- Utility Methods ---
 
     def extract_dims_from_xarray(self, data: xr.DataArray) -> Dict[str, Any]:
-        """Extracts size and scale information from an xarray.DataArray.
+        """Extract size and scale information from an xarray.DataArray.
 
         Parameters
         ----------
@@ -573,7 +582,7 @@ class ExperimentManager:
         return dims_meta
 
     def add_file(self, file_path: Path | str, metadata: dict[Any]):
-        """Add a single image container
+        """Add a single image container.
 
         Note the file as to in the project folder... is this good?
 
@@ -585,7 +594,6 @@ class ExperimentManager:
             Additional metadata as a dictionnary
 
         """
-
         pass
 
     def scan_data_directory(
@@ -1053,7 +1061,8 @@ class ExperimentManager:
         print("---------------------------------------\n")
 
     def to_dataframe(self):
-        """Export the experiment as a dataframe
+        """Export the experiment as a dataframe.
+
         Returns
         -------
         pd.DataFrame
@@ -1065,10 +1074,11 @@ class ExperimentManager:
             [x.to_data_row() for x in self.get_all_items()]
         )
 
-    def to_dict_for_annotation(self):
-        """Export the list of data to a dictionnary for proof-reading and annotation of channel and conditions
+    def to_annotation(self):
+        """Export the list of data to a dictionnary for proof-reading.
 
-        The dataset is split into consistent groups based on the content of the "channels" field.
+        The dataset is split into consistent groups based on the content of the
+        "channels" field.
         The list of files also contains the serie index.
 
         Returns
@@ -1086,21 +1096,20 @@ class ExperimentManager:
             for k, ng in enumerate(df.groupby("channels"))
         }
 
-    def save_dict_for_annotation(self, filepath):
-        """Save the data table to a yaml for user annotation
+    def export_annotation(self, filepath):
+        """Save the data table to a yaml for user annotation.
 
         Parameters
         ----------
         filepath: Path | str
             Path where to save the file
         """
-
-        data = self.to_dict_for_annotation()
+        data = self.to_annotation()
         with open(filepath, "w") as f:
             yaml.dump(data, f)
 
-    def update_annotation(self, filepath):
-        """Load user annotations and populate/update the annotation table
+    def import_annotation(self, filepath):
+        """Load user annotations and populate/update the annotation table.
 
         Parameters
         ----------
@@ -1165,9 +1174,7 @@ class ExperimentManager:
         ValueError
             If the specified scene cannot be found in the container file.
         """
-        abs_path = self.get_absolute_container_path(item.id)
-        if abs_path is None:
-            raise FileNotFoundError(f"Container path not found for item: {item.id}")
+        abs_path = item.get_absolute_container_path(self.data_dir)
 
         # Scenes are stored as strings (e.g., "0"), but readers iterate by integer index
         scene_idx = int(item.scene) if item.scene.isdigit() else 0
@@ -1202,13 +1209,55 @@ class ExperimentManager:
 
         return data
 
-    def iter_data(self) -> Iterator[Tuple[DataItem, xr.DataArray]]:
-        """Yields each DataItem and its associated xarray data.
+    def iter_data(
+        self, only_unprocessed: False = False
+    ) -> Iterator[Tuple[DataItem, xr.DataArray]]:
+        """Yield each DataItem and its associated xarray data.
+
+        Parameters
+        ----------
+        only_unprocessed: bool
+            Indicate whether or not to loop through only unprocessed items
 
         Yields
         ------
         Iterator[Tuple[DataItem, xr.DataArray]]
             A tuple of (DataItem, xr.DataArray).
         """
-        for item in self.get_all_items():
-            yield item, self.load_item_data(item)
+        if only_unprocessed:
+            for item in self.get_unprocessed_items():
+                yield item, self.load_item_data(item)
+        else:
+            for item in self.get_all_items():
+                yield item, self.load_item_data(item)
+
+    def apply(
+        self,
+        processing_fn: Callable,
+        client: Optional[Any] = None,
+        items: Optional[List["DataItem"]] = None,
+    ):
+        """
+        Apply a processing function to items (Pandas-like interface).
+
+        This method delegates to the functional `apply` in the processor module.
+
+        Parameters
+        ----------
+        processing_fn : Callable
+            The user-defined function to apply to each item. It receives
+            (DataItem, xr.DataArray, results_dir).
+        client : Optional[Any], optional
+            An active dask.distributed.Client for distributed execution.
+        items : Optional[List[DataItem]], optional
+            A specific list of items or an iterator to process. If None,
+            uses the manager's `iter_data(only_unprocessed=True)`.
+
+        Returns
+        -------
+        List
+            A list of results from the Dask computation.
+        """
+        from .processor import apply as _apply
+
+        return _apply(self, processing_fn, client=client, items=items)

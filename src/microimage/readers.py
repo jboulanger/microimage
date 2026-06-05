@@ -1,16 +1,17 @@
-from abc import ABC, abstractmethod
-import itertools
-from typing import Dict, Any, List, Generator, Self, Iterator, Tuple
-from pathlib import Path
-import tifffile
-import ome_types
-import numpy as np
-import xarray as xr
-import dask.array as da
-import hashlib
 import base64
+import hashlib
+import itertools
 import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Any, Dict, Generator, Iterator, List, Self, Tuple
+
 import dask
+import dask.array as da
+import numpy as np
+import ome_types
+import tifffile
+import xarray as xr
 
 try:
     from pylibCZIrw import czi as pyczi
@@ -44,7 +45,6 @@ def generate_scene_id(path: Path, scene_index: int) -> str:
     The ID is based on the file's name, its last modification time (in
     nanoseconds), and the scene's index within the file.
     """
-
     if not isinstance(path, Path):
         path = Path(path)
 
@@ -115,6 +115,12 @@ class BaseReader(ABC):
             # Standardize time dimension naming if 'time' is used instead of 'T'
             if "time" in scene.dims:
                 scene = scene.rename({"time": "T"})
+
+            # Remove H dimension if it is a singleton
+            if "H" in scene.dims:
+                if scene.shape[scene.dims.index("H")] == 1:
+                    scene = scene.drop_vars("H")
+                raise ValueError("Scene has non singleton H axes")
 
             # Identify and add missing dimensions as singletons
             missing_dims = [d for d in target_dims if d not in scene.dims]
@@ -243,10 +249,10 @@ class LSMReader(BaseReader):
             for scene_index in range(num_scenes):
                 store = self.tif.series[0].aszarr()
                 data = dask.array.from_zarr(store)[scene_index]
-                scene_id = generate_scene_id(self.path, scene_index)
-                scene_attrs = {**self.metadata, "unique_id": scene_id}
                 scene_dims = [d for d in self.axes_str if d != "P"]
                 scene_coords = {a: coords[a] for a in scene_dims if a in coords}
+                scene_id = generate_scene_id(self.path, scene_index)
+                scene_attrs = {**self.metadata, "unique_id": scene_id}
                 yield xr.DataArray(
                     data,
                     dims=scene_dims,
@@ -257,7 +263,7 @@ class LSMReader(BaseReader):
         else:
             store = self.tif.series[0].aszarr()
             data = dask.array.from_zarr(store)
-            scene_dims = [d for d in current_axes if d != "P"]
+            scene_dims = [d for d in self.axes_str if d != "P"]
             scene_coords = {a: coords[a] for a in scene_dims if a in coords}
             scene_id = generate_scene_id(self.path, 0)
             scene_attrs = {**self.metadata, "unique_id": scene_id}
@@ -472,7 +478,6 @@ class CZIReader(BaseReader):
         xr.DataArray
             A DataArray for each scene, with dimensions, coordinates, and metadata.
         """
-
         num_scenes = len(self.czi.scenes_bounding_rectangle)
 
         # Get the full shape from total_bounding_box, excluding 'S' (scene)
@@ -596,6 +601,7 @@ class ND2Reader(BaseReader):
     """Reader for ND2 files from Nikon Elements.
 
     .. warning::
+
     Parameters
     ----------
     path : Path

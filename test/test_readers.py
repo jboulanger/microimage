@@ -1,20 +1,18 @@
-import pytest
-import numpy as np
-import xarray as xr
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import dask.array as da
+import numpy as np
+import pytest
+import xarray as xr
+import zarr
+
 from microimage.readers import (
-    LSMReader,
-    TIFReader,
     CZIReader,
+    LSMReader,
     ND2Reader,
     Reader,
 )
-
-import dask.array as da
-import tifffile
-import zarr
 
 
 @pytest.fixture
