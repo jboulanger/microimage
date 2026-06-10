@@ -6,6 +6,7 @@ from .processor import apply
 from .readers import Reader
 from .results import Contours, Mask, Result, Table, Thumbnail
 
+
 __all__ = [
     "DataItem",
     "ExperimentManager",

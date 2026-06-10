@@ -14,11 +14,10 @@ import xarray as xr
 import yaml
 
 from .models import DataItem, MultiFileParser
-from .results import Contours, Mask, Result, Table, Thumbnail
 from .readers import BaseReader, Reader
+from .results import Contours, Mask, Result, Table, Thumbnail
+from .utils import show_contours, show_data
 from .writers import Writer
-from .utils import mask_to_yolo_contours
-
 
 logger = logging.getLogger(__name__)
 
@@ -1105,11 +1104,11 @@ class ExperimentManager:
 
             return Table(pd.read_csv(abs_path))
 
-        if logical_type == "yolo_segmentation":
+        if logical_type == "contours":
             contours_data = []
             with open(abs_path, "r") as f:
                 for line in f:
-                    parts = line.strip().split()
+                    parts = line.strip().split(" ")
                     if parts:
                         # Format: class_id x1 y1 x2 y2 ...
                         row = [int(parts[0])] + [float(x) for x in parts[1:]]
@@ -1191,3 +1190,31 @@ class ExperimentManager:
         from .processor import apply as _apply
 
         return _apply(self, processing_fn, client=client, items=items)
+
+    def show_data(self, item, channels, cmap, ax=None):
+        """Load and show the data item as maximum intensity projection at frame 0.
+
+        Parameters
+        ----------
+        item: DataItem
+            Item to show
+        channels: list[str]
+            Channels name to use.
+        cmap:list[str]
+        """
+        data = self.load_item_data(item)
+        show_data(data, channels, cmap, ax)
+
+    def show_contours(self, item, name):
+        """Show segmentation contours.
+
+        Parameters
+        ----------
+        item: DataItem
+            Item to show
+        """
+        contours = self.load_result(item, name)
+        show_contours(
+            [float(item.size_y) * item.scale_y, float(item.size_x) * item.scale_x],
+            contours.data,
+        )

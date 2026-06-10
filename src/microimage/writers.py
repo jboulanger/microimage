@@ -103,7 +103,7 @@ class YOLOWriter(BaseWriter):
     """A writer for YOLO segmentation and detection format (.txt)."""
 
     def write(self, data: Any, **kwargs):
-        """Write contours to a text file in YOLO format.
+        """Write contours to a text file in a generic format.
 
         Parameters
         ----------
@@ -122,7 +122,7 @@ WRITER_REGISTRY[".txt"] = YOLOWriter
 
 class Writer:
     """
-    A factory that provides the correct writer
+    A factory that provides the correct writer.
 
     This class uses the `__new__` method to act as a factory. When an
     instance of `Writer` is created, it inspects the file extension and

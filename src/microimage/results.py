@@ -36,7 +36,7 @@ class Contours(Result):
     """Represents object contours (usually saved as YOLO .txt)."""
 
     def __init__(self, data: Any, class_index: int = 0):
-        super().__init__(data, "yolo_segmentation", ".txt")
+        super().__init__(data, "contours", ".txt")
         self.class_index = class_index
         if isinstance(data, (xr.DataArray, np.ndarray)):
             self.data = mask_to_yolo_contours(self.data)
