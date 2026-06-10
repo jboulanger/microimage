@@ -1,9 +1,10 @@
 """Manager from microscopy experiments."""
 
 import json
+import logging
 import os
 import sqlite3
-from dataclasses import dataclass, field
+from contextlib import ExitStack
 from itertools import chain
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -12,7 +13,14 @@ import numpy as np
 import xarray as xr
 import yaml
 
-from .readers import Reader
+from .models import DataItem, MultiFileParser
+from .results import Contours, Mask, Result, Table, Thumbnail
+from .readers import BaseReader, Reader
+from .writers import Writer
+from .utils import mask_to_yolo_contours
+
+
+logger = logging.getLogger(__name__)
 
 
 # Custom connection factory to return dictionary rows instead of tuples
@@ -20,7 +28,7 @@ def dict_factory(cursor, row):
     """Convert SQLite tuple row results into a dictionary.
 
     This function is used as a `row_factory` for an sqlite3 connection
-    to make query results more intuitive to access by column name.
+    to make query results   more intuitive to access by column name.
 
     Parameters
     ----------
@@ -39,228 +47,6 @@ def dict_factory(cursor, row):
     for idx, col in enumerate(cursor.description):
         d[col[0]] = row[idx]
     return d
-
-
-# Type hint for the new parser function: takes a Path and returns a list of sub-item
-# data dictionaries.
-# Each dictionary MUST contain at least 'internal_index' and 'metadata'.
-MultiFileParser = Callable[
-    [Path], List[Dict[str, Any]]
-]  # Each dict should contain 'scene' and 'metadata'
-
-
-@dataclass
-class DataItem:
-    """
-    Represents a single processable item, such as an image or a scene.
-
-    This dataclass holds all information related to a single item, including its
-    source file, metadata, processing status, and any generated results. It is
-    designed to be a self-contained unit that can be serialized to and from
-    the database.
-
-    Parameters
-    ----------
-    relative_path : Path
-        The path to the container file, relative to the `ExperimentManager`'s
-        `data_dir`.
-    scene : str, optional
-        A unique identifier for the item within its container file (e.g., a
-        scene number). Defaults to "".
-
-    Attributes
-    ----------
-    metadata : Dict[str, Any]
-        A dictionary for storing arbitrary metadata about the item.
-    result_files : Dict[str, str]
-        A dictionary mapping a result type (str) to its relative path (str).
-    processed : bool
-        A flag indicating whether the item has been successfully processed.
-    error : Optional[str]
-        A string containing an error message if processing failed.
-    id : str
-        The unique identifier for the item, derived from the container name
-        and internal index (e.g., "image.czi:0").
-    """
-
-    # Required field, points to the container file
-    relative_path: Path
-
-    # The unique, hash-based identifier for this item.
-    id: str
-
-    # Fields with default values
-    scene: str = field(default="")  # The original scene index (e.g., "0", "1")
-    metadata: Dict[str, Any] = field(default_factory=dict)  # noqa
-    # This remains a Dict[type: path] in memory, but is stored in a separate DB table ('results').
-    # NOTE: Result paths are stored relative to ExperimentManager's project_root (DB parent).
-    result_files: Dict[str, str] = field(default_factory=dict)
-    processed: bool = field(default=False)
-
-    # NEW: Fields for basic dimensional metadata
-    size_t: Optional[int] = field(default=None)
-    size_c: Optional[int] = field(default=None)
-    size_z: Optional[int] = field(default=None)
-    size_y: Optional[int] = field(default=None)
-    size_x: Optional[int] = field(default=None)
-    scale_t: Optional[float] = field(default=None)
-    scale_z: Optional[float] = field(default=None)
-    scale_y: Optional[float] = field(default=None)
-    scale_x: Optional[float] = field(default=None)
-    channels: Optional[List[str]] = field(default=None)
-
-    # Annotated metadata from 'annotations' table
-    condition: Optional[str] = field(default=None)
-    annotated_channels: Optional[List[str]] = field(default=None)
-
-    error: Optional[str] = field(default=None)
-
-    def add_metadata(self, metadata_dict: Dict[str, Any]):
-        """Add or update key-value pairs in the item's metadata.
-
-        Parameters
-        ----------
-        metadata_dict : Dict[str, Any]
-            A dictionary of metadata to merge into the existing metadata.
-
-        """
-        self.metadata.update(metadata_dict)
-
-    def add_result_file(self, result_type: str, relative_path: str):
-        """Register a new result file for this item.
-
-        Parameters
-        ----------
-        result_type : str
-            A string identifying the type of result (e.g., "thumbnail", "mask").
-        relative_path : str
-            The path to the result file, relative to the project root.
-
-        """
-        self.result_files[result_type] = relative_path
-
-    def get_absolute_container_path(self, base_data_dir: Path) -> Path:
-        """Return the absolute path to the item's container file.
-
-        Parameters
-        ----------
-        base_data_dir : Path
-            The absolute path to the main data directory, which serves as the
-            base for the item's `relative_path`.
-
-        Returns
-        -------
-        Path
-            The resolved, absolute path to the container file.
-        """
-        return (base_data_dir / self.relative_path).resolve()
-
-    def get_full_id(self) -> str:
-        """Return the unique ID for this DataItem.
-
-        Returns
-        -------
-        str
-            The unique identifier string.
-        """
-        return self.id
-
-    def to_data_row(self) -> Dict[str, Any]:
-        """Convert the DataItem object into a dictionary.
-
-        Converts the DataItem object into a dictionary suitable for DB insertion/update
-        for the 'data' table (excluding result data).
-
-        Returns
-        -------
-        Dict[str, Any]
-            A dictionary representation of the item for the 'data' table.
-        """
-        return {
-            "id": self.id,
-            "relative_path": str(self.relative_path),
-            "scene": self.scene,
-            "metadata": json.dumps(self.metadata),
-            "processed": int(self.processed),
-            "error": self.error,
-            "size_t": self.size_t,
-            "size_c": self.size_c,
-            "size_z": self.size_z,
-            "size_y": self.size_y,
-            "size_x": self.size_x,
-            "scale_t": self.scale_t,
-            "scale_z": self.scale_z,
-            "scale_y": self.scale_y,
-            "scale_x": self.scale_x,
-            "channels": json.dumps(self.channels)
-            if self.channels is not None
-            else None,
-            "condition": self.condition,
-            "annotated_channels": json.dumps(self.annotated_channels)
-            if self.annotated_channels is not None
-            else None,
-        }
-
-    @classmethod
-    def from_db_row(
-        cls, data: Dict[str, Any], result_files: Optional[Dict[str, str]] = None
-    ) -> "DataItem":
-        """Create a DataItem instance from a database row.
-
-        Parameters
-        ----------
-        data : Dict[str, Any]
-            A dictionary representing a row from the 'data' table.
-        result_files : Optional[Dict[str, str]], optional
-            A dictionary of result files for this item, by default None.
-
-        Returns
-        -------
-        DataItem
-            A fully hydrated DataItem instance.
-        """
-        relative_path_str = data.get("relative_path")
-        if relative_path_str is None:
-            raise ValueError("Database row missing 'relative_path' key.")
-
-        item_id = data.get("id")
-        if not item_id:
-            raise ValueError("Database row missing 'id' key.")
-
-        scene = data.get("scene", "")
-        item = cls(id=item_id, relative_path=Path(relative_path_str), scene=scene)
-
-        # Hydrate the rest of the fields
-        item.metadata = json.loads(data.get("metadata", "{}") or "{}")
-        item.processed = bool(data.get("processed", 0))
-        item.error = data.get("error", None)
-
-        # Hydrate dimensional metadata
-        item.size_t = data.get("size_t")
-        item.size_c = data.get("size_c")
-        item.size_z = data.get("size_z")
-        item.size_y = data.get("size_y")
-        item.size_x = data.get("size_x")
-        item.scale_t = data.get("scale_t")
-        item.scale_z = data.get("scale_z")
-        item.scale_y = data.get("scale_y")
-        item.scale_x = data.get("scale_x")
-
-        # Hydrate channels from JSON
-        channels_json = data.get("channels")
-        if channels_json:
-            item.channels = json.loads(channels_json)
-
-        # Hydrate annotations from JOIN
-        item.condition = data.get("condition")
-        ann_channels_json = data.get("annotated_channels")
-        if ann_channels_json:
-            item.annotated_channels = json.loads(ann_channels_json)
-
-        if result_files:
-            item.result_files = result_files
-
-        return item
 
 
 class ExperimentManager:
@@ -305,7 +91,7 @@ class ExperimentManager:
         # Define the project root as the directory containing the DB file.
         # This acts as the common base for storing relative paths to results.
         self.project_root: Path = self.db_path.parent
-        print(f"Project root (Base for result paths) set to: {self.project_root}")
+        logger.info(f"Project root (Base for result paths) set to: {self.project_root}")
 
         # --- Enforce Data Directory constraints (Must Exist and be Readable) ---
         self.data_dir: Path = Path(data_dir).resolve()
@@ -331,6 +117,10 @@ class ExperimentManager:
                 f"Results directory is not writable: {self.results_dir}. Cannot save output files."
             )
 
+        # Cache for open file readers to support lazy loading and performance
+        self._stack = ExitStack()
+        self._readers: Dict[Path, BaseReader] = {}
+
         self._initialize_db()
 
     def _get_connection(self):
@@ -349,9 +139,28 @@ class ExperimentManager:
         conn.row_factory = dict_factory
         return conn
 
+    def __enter__(self) -> "ExperimentManager":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close all open file handles and clean up resources.
+
+        This should be called when the manager is no longer needed to ensure
+        that all microscopy file readers are properly closed.
+        """
+        try:
+            self._stack.close()
+        except Exception as e:
+            logger.error(f"Error while closing readers: {e}")
+        finally:
+            self._readers.clear()
+
     def _initialize_db(self):
         """Create the database tables if they do not already exist."""
-        print(f"Initializing database at {self.db_path}...")
+        logger.info(f"Initializing database at {self.db_path}...")
         conn = self._get_connection()
         try:
             # Enable WAL mode for better concurrency
@@ -384,6 +193,7 @@ class ExperimentManager:
                 CREATE TABLE IF NOT EXISTS results (
                     data_id TEXT NOT NULL,
                     result_type TEXT NOT NULL,
+                    logical_type TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
                     PRIMARY KEY (data_id, result_type),
                     FOREIGN KEY (data_id) REFERENCES data(id) ON DELETE CASCADE
@@ -400,15 +210,15 @@ class ExperimentManager:
                 )
             """)
             conn.commit()
-            print("Database structure verified/created.")
+            logger.info("Database structure verified/created.")
         except sqlite3.Error as e:
-            print(f"Database Initialization Error: {e}")
+            logger.error(f"Database Initialization Error: {e}")
         finally:
             conn.close()
 
     def _fetch_result_files(
         self, conn: sqlite3.Connection, item_id: str
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Dict[str, str]]:
         """Fetch all result files for a given item ID.
 
         Parameters
@@ -420,15 +230,20 @@ class ExperimentManager:
 
         Returns
         -------
-        Dict[str, str]
-            A dictionary mapping result type to relative file path.
+        Dict[str, Dict[str, str]]
+            A dictionary mapping result name to its metadata (path and type).
         """
         cursor = conn.execute(
-            "SELECT result_type, relative_path FROM results WHERE data_id = ?",
+            "SELECT result_type, logical_type, relative_path FROM results WHERE data_id = ?",
             (item_id,),
         )
-        # Convert list of rows (type, path) to a dictionary {type: path}
-        return {row["result_type"]: row["relative_path"] for row in cursor.fetchall()}
+        return {
+            row["result_type"]: {
+                "path": row["relative_path"],
+                "type": row["logical_type"],
+            }
+            for row in cursor.fetchall()
+        }
 
     def _fetch_item_with_results(
         self, conn: sqlite3.Connection, item_id: str
@@ -511,7 +326,7 @@ class ExperimentManager:
             count = conn.execute("SELECT COUNT(id) FROM data").fetchone()["COUNT(id)"]
             return count
         except sqlite3.Error as e:
-            print(f"Database Count Error: {e}")
+            logger.error(f"Database Count Error: {e}")
             return 0
         finally:
             conn.close()
@@ -617,7 +432,7 @@ class ExperimentManager:
             each file is treated as a single item.
 
         """
-        print(f"Scanning {self.data_dir} for new files...")
+        logger.info(f"Scanning {self.data_dir} for new files...")
         conn = self._get_connection()
         found_new_files = 0
 
@@ -630,7 +445,9 @@ class ExperimentManager:
             for container_path in all_container_paths:
                 # Skip hidden resource files (e.g., Mac OS ._ files)
                 if container_path.name.startswith("._"):
-                    print(f"  Skipping hidden resource file: {container_path.name}")
+                    logger.debug(
+                        f"Skipping hidden resource file: {container_path.name}"
+                    )
                     continue
 
                 # Delegate processing of each file to a helper method
@@ -641,16 +458,18 @@ class ExperimentManager:
 
             conn.commit()
             if found_new_files > 0:
-                print(f"Successfully registered {found_new_files} new items/sub-items.")
+                logger.info(
+                    f"Successfully registered {found_new_files} new items/sub-items."
+                )
             else:
-                print("No new files or sub-items found.")
+                logger.info("No new files or sub-items found.")
 
         except sqlite3.Error as e:
-            print(f"Database Scan Error: {e}")
+            logger.error(f"Database Scan Error: {e}")
             conn.rollback()
         except Exception as e:
             # Catch errors originating from the parser function
-            print(f"File Parser Error during scan: {e}")
+            logger.error(f"File Parser Error during scan: {e}")
             conn.rollback()
         finally:
             conn.close()
@@ -669,7 +488,7 @@ class ExperimentManager:
                                 :channels)""",
             row,
         )
-        print(f"  Registered new item: {item.id}")
+        logger.debug(f"Registered new item: {item.id}")
 
     def _process_container_file(
         self,
@@ -684,13 +503,13 @@ class ExperimentManager:
 
         # Use the provided parser or the default Reader to get scene information
         if multi_file_parser:
-            print(f"  Using parser to analyze file: {container_path.name}")
+            logger.debug(f"Using parser to analyze file: {container_path.name}")
             items_data_list = multi_file_parser(container_path)
         else:
             try:
                 with Reader(container_path) as reader:
                     for i, scene in enumerate(reader):
-                        print(f"Adding {container_path} scene [{i}]")
+                        logger.debug(f"Adding {container_path} scene [{i}]")
                         items_data_list.append(
                             {
                                 "scene": str(i),
@@ -698,7 +517,7 @@ class ExperimentManager:
                             }
                         )
             except Exception as e:
-                print(f"  Could not read {container_path.name}: {e}")
+                logger.warning(f"Could not read {container_path.name}: {e}")
                 return 0
 
         # Process each sub-item (scene) from the file
@@ -706,7 +525,9 @@ class ExperimentManager:
             item_id = item_data["_scene_xarray"].attrs["unique_id"]
 
             if not item_id:
-                print(f"  Skipping scene in {relative_path} due to missing unique_id.")
+                logger.warning(
+                    f"Skipping scene in {relative_path} due to missing unique_id."
+                )
                 continue
 
             # Check if item already exists
@@ -789,13 +610,13 @@ class ExperimentManager:
             # 3. Insert the current set of result files
             if item.result_files:
                 result_data = [
-                    (item.id, result_type, relative_path)
-                    for result_type, relative_path in item.result_files.items()
+                    (item.id, name, info["type"], info["path"])
+                    for name, info in item.result_files.items()
                 ]
                 conn.executemany(
                     """
-                    INSERT INTO results (data_id, result_type, relative_path)
-                    VALUES (?, ?, ?)
+                    INSERT INTO results (data_id, result_type, logical_type, relative_path)
+                    VALUES (?, ?, ?, ?)
                 """,
                     result_data,
                 )
@@ -850,7 +671,7 @@ class ExperimentManager:
                 )
             conn.commit()
         except sqlite3.Error as e:
-            print(f"Database Update Error for {item.id}: {e}")
+            logger.error(f"Database Update Error for {item.id}: {e}")
             conn.rollback()
         finally:
             conn.close()
@@ -925,7 +746,7 @@ class ExperimentManager:
             id_placeholders = ",".join(["?"] * len(item_ids))
             result_rows = conn.execute(
                 f"""
-                SELECT data_id, result_type, relative_path 
+                SELECT data_id, result_type, logical_type, relative_path 
                 FROM results 
                 WHERE data_id IN ({id_placeholders})
             """,
@@ -933,18 +754,21 @@ class ExperimentManager:
             ).fetchall()
 
             # 3. Map results to their item IDs
-            all_results: Dict[str, Dict[str, str]] = {
+            all_results: Dict[str, Dict[str, Dict[str, str]]] = {
                 item_id: {} for item_id in item_ids
             }
             for row in result_rows:
-                all_results[row["data_id"]][row["result_type"]] = row["relative_path"]
+                all_results[row["data_id"]][row["result_type"]] = {
+                    "path": row["relative_path"],
+                    "type": row["logical_type"],
+                }
 
             # 4. Create and return DataItem objects
             return [
                 DataItem.from_db_row(row, all_results[row["id"]]) for row in item_rows
             ]
         except sqlite3.Error as e:
-            print(f"Database Query Error: {e}")
+            logger.error(f"Database Query Error: {e}")
             return []
         finally:
             conn.close()
@@ -983,6 +807,24 @@ class ExperimentManager:
         """
         )
 
+    def get_processed_items(self) -> List[DataItem]:
+        """Return a list of all items marked as processed.
+
+        Returns
+        -------
+        List[DataItem]
+            A list of all `DataItem` objects where `processed` is False.
+        """
+        # processed =  (False)
+        return self._bulk_fetch_items(
+            """
+            SELECT d.*, a.condition, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+            WHERE d.processed = 1
+        """
+        )
+
     def get_items_with_errors(self) -> List[DataItem]:
         """Return a list of all items that have a recorded error.
 
@@ -1003,16 +845,16 @@ class ExperimentManager:
 
     def _update_item_status(self, where_clause: str = "1", message: str = ""):
         """Generic helper to reset the status of items based on a WHERE clause."""
-        print(f"Updating item status in DB: {message}")
+        logger.info(f"Updating item status in DB: {message}")
         conn = self._get_connection()
         try:
             cursor = conn.execute(
                 f"UPDATE data SET processed = 0, error = NULL WHERE {where_clause}"
             )
             conn.commit()
-            print(f"Reset status for {cursor.rowcount} items.")
+            logger.info(f"Reset status for {cursor.rowcount} items.")
         except sqlite3.Error as e:
-            print(f"Database Reset Error: {e}")
+            logger.error(f"Database Reset Error: {e}")
         finally:
             conn.close()
 
@@ -1046,19 +888,19 @@ class ExperimentManager:
                 "SELECT COUNT(id) FROM data WHERE error IS NOT NULL"
             ).fetchone()["COUNT(id)"]
         except sqlite3.Error as e:
-            print(f"Database Report Error: {e}")
+            logger.error(f"Database Report Error: {e}")
             processed_count, error_count = 0, 0
         finally:
             conn.close()
 
         unprocessed_count = total - processed_count - error_count
 
-        print("\n--- Experiment Status (from SQLite) ---")
-        print(f"Total Items:     {total}")
-        print(f"Processed:       {processed_count}")
-        print(f"Unprocessed:     {unprocessed_count}")
-        print(f"With Errors:     {error_count}")
-        print("---------------------------------------\n")
+        logger.info("--- Experiment Status (from SQLite) ---")
+        logger.info(f"Total Items:     {total}")
+        logger.info(f"Processed:       {processed_count}")
+        logger.info(f"Unprocessed:     {unprocessed_count}")
+        logger.info(f"With Errors:     {error_count}")
+        logger.info("---------------------------------------")
 
     def to_dataframe(self):
         """Export the experiment as a dataframe.
@@ -1079,7 +921,6 @@ class ExperimentManager:
 
         The dataset is split into consistent groups based on the content of the
         "channels" field.
-        The list of files also contains the serie index.
 
         Returns
         -------
@@ -1148,7 +989,7 @@ class ExperimentManager:
                         item.condition = condition
                         item.annotated_channels = channels
                         self.update_item(item)
-                    print(
+                    logger.info(
                         f"Updated annotations for {len(affected_items)} items in {rel_path}."
                     )
 
@@ -1179,29 +1020,24 @@ class ExperimentManager:
         # Scenes are stored as strings (e.g., "0"), but readers iterate by integer index
         scene_idx = int(item.scene) if item.scene.isdigit() else 0
 
-        # To ensure dask arrays remain functional after this method returns, we avoid
-        # using a context manager here. Many microscopy readers (CZI, ND2, LSM)
-        # require the underlying file handle to remain open for lazy loading.
-        reader = Reader(abs_path)
-        data = None
-        for i, scene in enumerate(reader):
-            if i == scene_idx:
-                data = scene
-                break
+        # Retrieve from cache or open new reader
+        if abs_path not in self._readers:
+            reader = Reader(abs_path)
+            self._stack.enter_context(reader)
+            self._readers[abs_path] = reader
 
-        if data is None:
+        reader = self._readers[abs_path]
+        try:
+            data = reader.get_scene(scene_idx)
+        except IndexError:
             raise ValueError(f"Scene {item.scene} not found in {abs_path}")
-
-        # Attach the reader instance to the xarray to keep its lifecycle tied
-        # to the data, preventing premature garbage collection and file closing.
-        data.attrs["_reader"] = reader
 
         # Apply annotated channel names if they exist and match the count
         if item.annotated_channels:
             if "C" in data.dims and len(item.annotated_channels) == data.sizes["C"]:
                 data.coords["C"] = item.annotated_channels
             else:
-                print(f"Warning: Annotation channel count mismatch for {item.id}")
+                logger.warning(f"Annotation channel count mismatch for {item.id}")
 
         # Attach condition to attributes
         if item.condition:
@@ -1209,14 +1045,108 @@ class ExperimentManager:
 
         return data
 
+    def save_result(self, item: "DataItem", result_name: str, data: Result):
+        """Save a result object to the results directory and track it.
+
+        The file path is automatically generated based on the result_name and logical_type.
+
+        Parameters
+        ----------
+        item : DataItem
+            The item the result belongs to.
+        result_name : str
+            The unique identifier for this result (used as filename and DB key).
+        data : Result
+            The data to save.
+        """
+        # Path relative to results_dir: item_id/result_name.ext
+        rel_result_path = Path(item.id) / f"{result_name}{data.ext}"
+        abs_result_path = self.results_dir / rel_result_path
+        abs_result_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 2. Use Writer to save
+        with Writer(abs_result_path) as writer:
+            writer.write(data.data)
+
+        # 3. Update DataItem
+        # Result paths in DB are relative to results_dir
+        path_to_store = abs_result_path.relative_to(self.results_dir)
+        item.add_result_file(result_name, str(path_to_store), data.logical_type)
+
+    def load_result(self, item: "DataItem", result_name: str) -> Result:
+        """Load a result by name and return it as the appropriate Result type.
+
+        Parameters
+        ----------
+        item : DataItem
+            The item whose result to load.
+        result_name : str
+            The name of the result to load.
+
+        Returns
+        -------
+        Result
+            The loaded result wrapped in its specific Result class.
+        """
+        if result_name not in item.result_files:
+            raise KeyError(f"Result '{result_name}' not found for item {item.id}")
+
+        res_info = item.result_files[result_name]
+        logical_type = res_info["type"]
+        abs_path = self.results_dir / res_info["path"]
+
+        if logical_type == "mask":
+            import tifffile
+
+            return Mask(tifffile.imread(abs_path))
+
+        if logical_type == "table":
+            import pandas as pd
+
+            return Table(pd.read_csv(abs_path))
+
+        if logical_type == "yolo_segmentation":
+            contours_data = []
+            with open(abs_path, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if parts:
+                        # Format: class_id x1 y1 x2 y2 ...
+                        row = [int(parts[0])] + [float(x) for x in parts[1:]]
+                        contours_data.append(row)
+            return Contours(contours_data)
+
+        if logical_type == "thumbnail":
+            import tifffile
+
+            return Thumbnail(tifffile.imread(abs_path))
+
+        return Result(data=None, logical_type=logical_type)
+
+    def iter_results(self, result_name) -> Iterator[Tuple[DataItem, Result]]:
+        """Yield each Result.
+
+        Parameters
+        ----------
+        result_name : str
+            The name of the result to load.
+
+        Returns
+        -------
+        Iterator[Tuple[DataItem, Result]]
+            A tuple of (DataItem, Result).
+        """
+        for item in self.get_processed_items():
+            yield item, self.load_result(item, result_name)
+
     def iter_data(
-        self, only_unprocessed: False = False
+        self, only_unprocessed: bool = False
     ) -> Iterator[Tuple[DataItem, xr.DataArray]]:
         """Yield each DataItem and its associated xarray data.
 
         Parameters
         ----------
-        only_unprocessed: bool
+        only_unprocessed : bool, optional
             Indicate whether or not to loop through only unprocessed items
 
         Yields

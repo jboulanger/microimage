@@ -1,6 +1,7 @@
+import csv
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Generator, Iterator, Self
+from typing import Any, Generator, Iterator, Self
 
 import tifffile
 import xarray as xr
@@ -23,41 +24,26 @@ class BaseWriter(ABC):
     def __init__(self, path: Path):
         self.path = path
 
-    @abstractmethod
-    def __enter__(self) -> Self:
+    def __enter__(self) -> "BaseWriter":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close the writer and release resources."""
         pass
 
     @abstractmethod
-    def __exit__(self, type, value, traceback):
-        pass
+    def write(self, data: Any, **kwargs):
+        """Write data to the file.
 
-    def __iter__(self) -> Iterator[xr.DataArray]:
-        return self.iter_scenes()
-
-    @abstractmethod
-    def __len__(self) -> int:
-        """Return the number of scenes in the file.
-
-        Returns
-        -------
-        int
-            The total number of scenes.
-
-        """
-        pass
-
-    @abstractmethod
-    def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
-        """Yield each scene from the image file as a lazy `dask`-backed DataArray.
-
-        This method is a generator that iterates through all scenes in
-        the file, yielding each one as an `xarray.DataArray`.
-
-        Yields
-        ------
-        xr.DataArray
-            An xarray DataArray representing a single scene from the file,
-            complete with dimensions, coordinates, and metadata where available.
+        Parameters
+        ----------
+        data : Any
+            The data to be written (e.g., xarray.DataArray, numpy.ndarray).
+        **kwargs : dict
+            Additional writer-specific arguments.
 
         """
         pass
@@ -67,9 +53,71 @@ WRITER_REGISTRY = {}
 
 
 class TIFFWriter(BaseWriter):
-    def __init__(self, path: Path):
-        super().__init__(path)
-        self.tif = tifffile.TiffFile(path)
+    """A writer for TIFF files using tifffile."""
+
+    def write(self, data: Any, **kwargs):
+        """Write an image to a TIFF file.
+
+        If data is an xarray.DataArray, it uses its values and metadata.
+        """
+        if isinstance(data, xr.DataArray):
+            # Ensure directory exists
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tifffile.imwrite(str(self.path), data.values, **kwargs)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tifffile.imwrite(str(self.path), data, **kwargs)
+
+
+WRITER_REGISTRY[".tif"] = TIFFWriter
+WRITER_REGISTRY[".tiff"] = TIFFWriter
+
+
+class CSVWriter(BaseWriter):
+    """A writer for CSV files."""
+
+    def write(self, data: Any, **kwargs):
+        """Write tabular data to a CSV file.
+
+        Supports pandas.DataFrame or a list of dictionaries.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Handle pandas DataFrame or similar objects with to_csv method
+        if hasattr(data, "to_csv"):
+            index = kwargs.pop("index", False)
+            data.to_csv(self.path, index=index, **kwargs)
+        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            with open(self.path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=data[0].keys(), **kwargs)
+                writer.writeheader()
+                writer.writerows(data)
+        else:
+            raise ValueError(f"Unsupported data type for CSVWriter: {type(data)}")
+
+
+WRITER_REGISTRY[".csv"] = CSVWriter
+
+
+class YOLOWriter(BaseWriter):
+    """A writer for YOLO segmentation and detection format (.txt)."""
+
+    def write(self, data: Any, **kwargs):
+        """Write contours to a text file in YOLO format.
+
+        Parameters
+        ----------
+        data : List[List[Union[int, float]]]
+            A list where each entry is [class_id, x1, y1, x2, y2, ...].
+            Coordinates should typically be normalized (0-1).
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w") as f:
+            for row in data:
+                f.write(" ".join(map(str, row)) + "\n")
+
+
+WRITER_REGISTRY[".txt"] = YOLOWriter
 
 
 class Writer:
@@ -108,7 +156,8 @@ class Writer:
     """
 
     def __new__(cls, path: Path, *args, **kwargs) -> BaseWriter:
-        ext = Path(path).suffix.lower()
+        path = Path(path)
+        ext = path.suffix.lower()
         writer_class = WRITER_REGISTRY.get(ext)
         if not writer_class:
             raise ValueError(f"Unsupported file extension: {ext}")

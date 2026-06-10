@@ -40,7 +40,7 @@ except ImportError:
 
 
 def generate_scene_id(path: Path, scene_index: int) -> str:
-    """Generates a unique SHA1 hash ID for a scene.
+    """Generate a unique SHA1 hash ID for a scene.
 
     The ID is based on the file's name, its last modification time (in
     nanoseconds), and the scene's index within the file.
@@ -55,7 +55,8 @@ def generate_scene_id(path: Path, scene_index: int) -> str:
         mod_time = 0
     id_string = f"{path.name}-{mod_time}-{scene_index}"
     hasher = hashlib.sha256(id_string.encode("utf-8")).digest()
-    return base64.urlsafe_b64encode(hasher).decode("utf-8")[:8]
+    text = base64.b32encode(hasher).decode("utf-8")[:8]
+    return f"{text[:4]}-{text[4:]}"
 
 
 class BaseReader(ABC):
@@ -98,6 +99,31 @@ class BaseReader(ABC):
         """
         pass
 
+    def _normalize_scene(self, scene: xr.DataArray) -> xr.DataArray:
+        """Normalize an xarray DataArray to the standard 5D format (T, C, Z, Y, X)."""
+        target_dims = ("T", "C", "Z", "Y", "X")
+
+        # Standardize time dimension naming if 'time' is used instead of 'T'
+        if "time" in scene.dims:
+            scene = scene.rename({"time": "T"})
+
+        # Remove H dimension if it is a singleton
+        if "H" in scene.dims:
+            if scene.shape[scene.dims.index("H")] == 1:
+                scene = scene.drop_vars("H")
+            else:
+                raise ValueError("Scene has non singleton H axes")
+
+        # Identify and add missing dimensions as singletons
+        missing_dims = [d for d in target_dims if d not in scene.dims]
+        if missing_dims:
+            scene = scene.expand_dims({d: 1 for d in missing_dims})
+
+        # Reorder dimensions to the standard (T, C, Z, Y, X)
+        # Any unexpected extra dimensions are appended after the target ones.
+        order = list(target_dims) + [d for d in scene.dims if d not in target_dims]
+        return scene.transpose(*order)
+
     def iter_scenes_normalized(self) -> Generator[xr.DataArray, None, None]:
         """Yield each scene with dimensions normalized to (T, C, Z, Y, X).
 
@@ -110,27 +136,28 @@ class BaseReader(ABC):
         xr.DataArray
             An xarray DataArray with dimensions (T, C, Z, Y, X).
         """
-        target_dims = ("T", "C", "Z", "Y", "X")
         for scene in self.iter_scenes():
-            # Standardize time dimension naming if 'time' is used instead of 'T'
-            if "time" in scene.dims:
-                scene = scene.rename({"time": "T"})
+            yield self._normalize_scene(scene)
 
-            # Remove H dimension if it is a singleton
-            if "H" in scene.dims:
-                if scene.shape[scene.dims.index("H")] == 1:
-                    scene = scene.drop_vars("H")
-                raise ValueError("Scene has non singleton H axes")
+    def get_scene(self, index: int) -> xr.DataArray:
+        """Get a specific scene by index, normalized to 5D (T, C, Z, Y, X).
 
-            # Identify and add missing dimensions as singletons
-            missing_dims = [d for d in target_dims if d not in scene.dims]
-            if missing_dims:
-                scene = scene.expand_dims({d: 1 for d in missing_dims})
+        Parameters
+        ----------
+        index : int
+            The index of the scene to retrieve.
 
-            # Reorder dimensions to the standard (T, C, Z, Y, X)
-            # Any unexpected extra dimensions are appended after the target ones.
-            order = list(target_dims) + [d for d in scene.dims if d not in target_dims]
-            yield scene.transpose(*order)
+        Returns
+        -------
+        xr.DataArray
+            The normalized scene data.
+        """
+        # Default implementation iterates through scenes.
+        # Subclasses can override this for more efficient random access.
+        for i, scene in enumerate(self.iter_scenes_normalized()):
+            if i == index:
+                return scene
+        raise IndexError(f"Scene index {index} out of range for {self.path}")
 
     @abstractmethod
     def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
@@ -217,20 +244,21 @@ class LSMReader(BaseReader):
             A DataArray for each scene, with dimensions, coordinates, and metadata.
 
         """
+        meters = 1e6
         try:
             coords = {
                 "T": np.arange(self.metadata["DimensionTime"])
                 * self.metadata.get("TimeIntervall", 1.0),
                 "Z": [
-                    z * self.metadata["VoxelSizeZ"]
+                    z * self.metadata["VoxelSizeZ"] * meters
                     for z in range(self.metadata["DimensionZ"])
                 ],
                 "Y": [
-                    y * self.metadata["VoxelSizeY"]
+                    y * self.metadata["VoxelSizeY"] * meters
                     for y in range(self.metadata["DimensionY"])
                 ],
                 "X": [
-                    x * self.metadata["VoxelSizeX"]
+                    x * self.metadata["VoxelSizeX"] * meters
                     for x in range(self.metadata["DimensionX"])
                 ],
                 "C": self.metadata["ChannelColors"]["ColorNames"],
@@ -633,18 +661,43 @@ class ND2Reader(BaseReader):
         """
         return self.nd2.sizes.get("P", 1)
 
+    def get_scene(self, index: int) -> xr.DataArray:
+        """Get a specific scene by index with fast random access.
+
+        Parameters
+        ----------
+        index : int
+            The index of the scene to retrieve.
+
+        Returns
+        -------
+        xr.DataArray
+            The normalized scene data.
+        """
+        if index < 0 or index >= len(self):
+            raise IndexError(f"Scene index {index} out of range for {self.path}")
+
+        # Get the full xarray DataArray, which will be dask-backed
+        full_xarray = self.nd2.to_xarray(delayed=True)
+
+        if "P" in full_xarray.dims:
+            scene_data = full_xarray.isel(P=index)
+        else:
+            scene_data = full_xarray
+
+        scene_data.attrs["unique_id"] = generate_scene_id(self.path, index)
+        return self._normalize_scene(scene_data)
+
     def iter_scenes(self) -> Generator[xr.DataArray, None, None]:
         """Yield scenes from the ND2 file as xarray DataArrays.
 
         This generator uses the `nd2` library's `to_xarray` method to create
-        a Dask-backed xarray DataArray for the entire file. If the file contains
-        multiple scenes (indicated by a 'P' dimension), it iterates through
-        and yields each scene. Otherwise, it yields the single DataArray.
+        a Dask-backed xarray DataArray for the entire file.
 
         Yields
         ------
         xr.DataArray
-            A DataArray for each scene, with dimensions, coordinates, and metadata.
+            A DataArray for each scene.
         """
         # Get the full xarray DataArray, which will be dask-backed
         full_xarray = self.nd2.to_xarray(delayed=True)

@@ -15,6 +15,7 @@ dependencies = [
     "liffile",
     "imaris-ims-file-reader>=0.1.8",
     "slideio>=2.7.4",
+    "scikit-image>=0.25.2",
 ]
 
 [project.optional-dependencies]

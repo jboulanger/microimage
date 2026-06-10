@@ -38,14 +38,24 @@ from functools import partial
 data_dir = "data/"
 results_dir = "results/"
 db_path = "project.db"
-m = ExperimentManager(data_dir, results_dir, db_path)
-p = MetadataParser({"dapi": 1, "gfp": 2, "rfp": 0})
-m.scan_data_directory(["lsm","czi"], p)
+exp = ExperimentManager(data_dir, results_dir, db_path)
+exp.export_annotation("annotation.yml")
+
+# verify the annotations
+exp.import_annotation("annotation.yml")
+
+# process all files
+def process(item, data):
+    return {"table":Table(),"labels":Contours()}
+
+exp.apply(process)
 
 
 cluster = LocalCluster(n_workers=4, threads_per_worker=1)
 client = Client(cluster)
 print(f"Dask Dashboard link: {client.dashboard_link}")
+
+microimage.apply(process,)
 
 configured_worker_task = partial(
     dask_worker_task, 

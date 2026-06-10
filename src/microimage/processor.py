@@ -10,14 +10,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import xarray as xr
 
-from . import DataItem, ExperimentManager
+from .manager import ExperimentManager
+from .models import DataItem
+from .results import Result
 
 logger = logging.getLogger(__name__)
 
 
 def _apply_to_item(
     item: Union[DataItem, Tuple[DataItem, xr.DataArray]],
-    processing_fn: Callable[[DataItem, xr.DataArray, Path], Dict[str, Path]],
+    processing_fn: Callable[[DataItem, xr.DataArray], Dict[str, Any]],
     data_dir: Path,
     results_dir: Path,
     db_path: Path,
@@ -32,10 +34,9 @@ def _apply_to_item(
     item : Union[DataItem, Tuple[DataItem, xr.DataArray]]
         The item to be processed. Can be a DataItem object or a tuple
         containing a DataItem and its pre-loaded xr.DataArray.
-    processing_fn : Callable[[DataItem, xr.DataArray, Path], Dict[str, Path]]
-        A user-defined function that accepts a DataItem, the loaded image data,
-        and the results directory, returning a dictionary mapping result
-        types to output file paths.
+    processing_fn : Callable[[DataItem, xr.DataArray], Dict[str, Any]]
+        A user-defined function that accepts a DataItem and the loaded image data.
+        It returns a dictionary mapping result types to data objects (e.g., Arrays).
     data_dir : Path
         The absolute path to the raw data directory.
     results_dir : Path
@@ -49,72 +50,58 @@ def _apply_to_item(
         A tuple containing (item_id, success_flag, error_message).
 
     """
-    # CRITICAL: Re-initialize ExperimentManager locally on the worker process
-    # using the paths passed from the main function.
-    try:
-        worker_manager = ExperimentManager(
-            data_dir=data_dir, results_dir=results_dir, db_path=db_path
-        )
-    except Exception as e:
-        # item may be a tuple (DataItem, xr.DataArray)
-        item_id = getattr(item[0] if isinstance(item, tuple) else item, "id", None)
-        logger.error(f"Worker failed to initialize ExperimentManager: {e}")
-        return item_id, False, f"Worker initialization failed: {e}"
-
     # Normalize item and data: item may be (DataItem, xr.DataArray)
     target_item = item[0] if isinstance(item, tuple) else item
-    logger.info(f"Starting work on ID: {target_item.id}")
+    item_id = target_item.id
 
     try:
-        if isinstance(item, tuple):
-            # pre-loaded data provided by the caller
-            data = item[1]
-        else:
-            # Load the data using the worker's manager (this handles channel mapping)
-            data = worker_manager.load_item_data(target_item)
+        # Using context manager ensures files are closed even if processing fails
+        with ExperimentManager(
+            data_dir=data_dir, results_dir=results_dir, db_path=db_path
+        ) as worker_manager:
+            logger.info(f"Starting work on ID: {item_id}")
 
-        # 1. Run the core logic using the loaded data.
-        # Note: processing_fn can also update item.metadata or item.condition directly.
-        generated_files: Dict[str, Path] = processing_fn(
-            target_item, data, worker_manager.results_dir
-        )
-
-        # 2. Update the DataItem object
-        for result_type, f_path in generated_files.items():
-            # Ensure the path is relative to results directory for DB consistency
             try:
-                # Check if it's already relative or subpath of project_root
-                p = Path(f_path)
-                if p.is_absolute():
-                    rel_path = p.relative_to(worker_manager.results_dir)
+                if isinstance(item, tuple):
+                    data = item[1]
                 else:
-                    rel_path = p
-                target_item.add_result_file(result_type, str(rel_path))
-            except Exception:
-                target_item.add_result_file(result_type, str(f_path))
+                    data = worker_manager.load_item_data(target_item)
 
-        target_item.processed = True
-        target_item.error = None
+                # 1. Process scenes
+                results = processing_fn(target_item, data)
+
+                # 2. Store results
+                if results:
+                    for res_name, res_obj in results.items():
+                        if not isinstance(res_obj, Result):
+                            raise TypeError(
+                                f"Result '{res_name}' must be an instance of Result."
+                                f"got {type(res_obj)} instead."
+                            )
+                        worker_manager.save_result(target_item, res_name, res_obj)
+
+                target_item.processed = True
+                target_item.error = None
+
+            except Exception as e:
+                logger.error(f"Error processing {item_id}: {e}", exc_info=True)
+                target_item.processed = False
+                target_item.error = str(e)
+            finally:
+                # Commit result to DB before the manager closes its connection
+                worker_manager.update_item(target_item)
+                logger.info(f"Finished and committed status for ID: {item_id}")
 
     except Exception as e:
-        logger.error(f"Error processing {target_item.id} on worker: {e}", exc_info=True)
-        target_item.processed = False
-        target_item.error = str(e)
-
-    finally:
-        # 3. CRITICAL: Commit the result to the shared DB
-        try:
-            worker_manager.update_item(target_item)
-            logger.info(f"Finished and committed status for ID: {target_item.id}")
-        except Exception:
-            logger.exception("Failed to commit item status to DB")
+        logger.error(f"Worker failed to initialize ExperimentManager: {e}")
+        return item_id, False, f"Worker initialization failed: {e}"
 
     return target_item.id, target_item.processed, target_item.error
 
 
 def apply(
     manager: ExperimentManager,
-    processing_fn: Callable[[DataItem, xr.DataArray, Path], Dict[str, Path]],
+    processing_fn: Callable[[DataItem, xr.DataArray], Dict[str, Any]],
     client: Optional[Any] = None,
     items: Optional[List[DataItem]] = None,
 ) -> List:
@@ -125,9 +112,9 @@ def apply(
     ----------
     manager : ExperimentManager
         The manager instance providing access to the experiment database and paths.
-    processing_fn : Callable[[DataItem, xr.DataArray, Path], Dict[str, Path]]
+    processing_fn : Callable[[DataItem, xr.DataArray], Dict[str, Any]]
         The core logic to apply to each item. It receives the DataItem and
-        the loaded xarray data (with annotations applied), and the results directory.
+        the loaded xarray data (with annotations applied).
     client : Optional[Any], optional
         An active dask.distributed.Client. If None, execution occurs locally
         using dask.bag. Defaults to None.
@@ -142,9 +129,9 @@ def apply(
 
     Example
     -------
-    >>> def process(item, data, results_dir):
+    >>> def process(item, data):
     >>>     print(item)
-    >>>     return {"labels":"labels.tif","measurements":"measurement.csv"}
+    >>>     return {"mask": some_array, "table1": some_df}
     >>>
     >>> microimage.apply(exp, process)
     """
@@ -167,9 +154,11 @@ def apply(
         # Distributed execution (Asynchronous)
         return client.map(_apply_to_item, items, **task_kwargs)
     else:
-        # Local execution
+        # Sequential Local execution
         import dask.bag
 
         return (
-            dask.bag.from_sequence(items).map(_apply_to_item, **task_kwargs).compute()
+            dask.bag.from_sequence(items)
+            .map(_apply_to_item, **task_kwargs)
+            .compute(scheduler="synchronous")
         )
