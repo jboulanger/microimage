@@ -16,7 +16,7 @@ import yaml
 from .models import DataItem, MultiFileParser
 from .readers import BaseReader, Reader
 from .results import Contours, Mask, Result, Table, Thumbnail
-from .utils import show_contours, show_data
+from .utils import inspect_data, show_contours, show_data, show_points, show_scalebar
 from .writers import Writer
 
 logger = logging.getLogger(__name__)
@@ -474,7 +474,7 @@ class ExperimentManager:
             conn.close()
 
     def _create_item_in_db(self, conn: sqlite3.Connection, item: DataItem):
-        """Inserts a single DataItem into the database."""
+        """Insert a single DataItem into the database."""
         row = item.to_data_row()
         conn.execute(
             """
@@ -495,7 +495,7 @@ class ExperimentManager:
         conn: sqlite3.Connection,
         multi_file_parser: Optional[MultiFileParser],
     ) -> int:
-        """Processes a single container file, creating and adding items to the DB."""
+        """Process a single image container file, adding items to the DB."""
         relative_path = container_path.relative_to(self.data_dir)
         items_data_list = []
         new_items_count = 0
@@ -939,6 +939,11 @@ class ExperimentManager:
     def export_annotation(self, filepath):
         """Save the data table to a yaml for user annotation.
 
+        The yaml file group the data in set of consistent channels.
+        Create new groups if required (eg by condition) and update
+        the name of the channel to a semantic that will be used for
+        processing the data later on.
+
         Parameters
         ----------
         filepath: Path | str
@@ -1191,7 +1196,7 @@ class ExperimentManager:
 
         return _apply(self, processing_fn, client=client, items=items)
 
-    def show_data(self, item, channels, cmap, ax=None):
+    def show_data(self, item, channels, cmap, percentiles=[0, 100], gamma=1.0, ax=None):
         """Load and show the data item as maximum intensity projection at frame 0.
 
         Parameters
@@ -1203,9 +1208,22 @@ class ExperimentManager:
         cmap:list[str]
         """
         data = self.load_item_data(item)
-        show_data(data, channels, cmap, ax)
+        show_data(data, channels, cmap, percentiles, gamma, ax)
 
-    def show_contours(self, item, name):
+    def inspect_data(self, item, ax):
+        """Display each channel for the item.
+
+        Parameters
+        ----------
+        item: DataItem
+            Item to display
+        ax: matplotlib.axes
+            Axes to use
+        """
+        data = self.load_item_data(item)
+        inspect_data(data, ax)
+
+    def show_contours(self, item, name, ax=None):
         """Show segmentation contours.
 
         Parameters
@@ -1217,4 +1235,44 @@ class ExperimentManager:
         show_contours(
             [float(item.size_y) * item.scale_y, float(item.size_x) * item.scale_x],
             contours.data,
+            ax,
         )
+
+    def show_points(self, item, name, columns=None, ax=None, **kwargs):
+        """Load coordinates of points from a table and add then to the figure.
+
+        Parameters
+        ----------
+        item: DataItem
+        name: str
+            Name of the table to load
+        columns: list[str]
+            Name of the 2 columns to use for x and y coordinates.
+
+        """
+        df = self.load_result(item, name).data
+        # Check that the requested columns are in the table columns
+        if columns is None:
+            if item.size_z == 1:
+                columns = ["centroid-0", "centroid-1"]
+            else:
+                columns = ["centroid-2", "centroid-1"]
+        for x in columns:
+            if x not in df.columns:
+                raise KeyError(f"Column {x} in not in table {name}")
+        if "frame index" in df.columns:
+            df = df[df["frame index"] == 0]
+        points = np.array(df[columns])
+        show_points(
+            points[:, 0] * item.scale_x, points[:, 1] * item.scale_y, ax=ax, **kwargs
+        )
+
+    def show_scalebar(self, item, color="white", ax=None):
+        """Show a scalebar."""
+        data = self.load_item_data(item)
+        xmin = data["X"][0].item()
+        xmax = data["X"][-1].item()
+        ymin = data["Y"][0].item()
+        ymax = data["Y"][-1].item()
+
+        show_scalebar(xmin, xmax, ymin, ymax, color, ax)
