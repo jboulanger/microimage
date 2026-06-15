@@ -30,7 +30,7 @@ Python file management tool high-throughput microscopy pipelines where standardi
     - Process all items with a user defined processing callable.
 
 ## Database Schema
-The project uses a SQLite database to track images, metadata, and processing results.
+The project uses a SQLite database to track images, annotation, and processing results.
 
 ### `data` Table
 Stores core information and dimensional metadata for each scene.
@@ -46,6 +46,17 @@ Stores core information and dimensional metadata for each scene.
 | `size_t, size_c, ...` | INTEGER | Dimensional sizes (T, C, Z, Y, X). |
 | `scale_t, scale_z, ...` | REAL | Physical scaling/calibration for dimensions. |
 | `channels` | TEXT | JSON list of channel names. |
+
+### `annotation` Table
+Stores user annotations providing semantic channel names and information on experimental setting (condition, runs, etc)
+
+| Column | Type | Description |
+| :--- | :--- | :--- |
+| `data_id` | TEXT | Foreign Key referencing `data.id`. |
+| `channels` | TEXT | JSON list of channel names. |
+| `metadata` | TEXT | JSON string of arbitrary metadata.|
+
+*Primary Key is `(data_id)`.*
 
 ### `results` Table
 Tracks output files generated during processing.

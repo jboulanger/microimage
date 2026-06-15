@@ -4,6 +4,8 @@ This project aims at factoring code that is used repetitively when developing wo
 
 It is composed of a dataset management, unified image readers and writers working with xarray and basic batch processing.
 
+The basic element that is manipulated is a "scene" in a dataset corresponding to a position in space.
+
 ## Installation
 
 ```bash
@@ -18,9 +20,20 @@ pip install ...
 │   ├── image001.lsm
 │   ├── image002.lsm
 │   └── image003.lsm
+├── results
+│   ├── WEDF-ERPT
+│   │   ├── contours.txt
+│   │   └── measurements.csv
+│   ├── OXDF-BFJP
+│   └── QQAP-FGOP
 └── project
+    ├── annotation.yml
     └── project.db
 ```
+
+- The `results` folder contains one subfolder per scene.
+- The annotation file, is modified to add extra information and provide the semantic channel labels.
+
 
 ## Usage
 
@@ -77,5 +90,6 @@ configured_worker_task = partial(
 | VSI    | yes  |       |
 | IMS    | yes  |       |
 | NGFF   |      |       |     
+
 
 

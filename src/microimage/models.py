@@ -57,8 +57,7 @@ class DataItem:
     # Fields with default values
     scene: str = field(default="")  # The original scene index (e.g., "0", "1")
     metadata: Dict[str, Any] = field(default_factory=dict)  # noqa
-    # This stores name -> {"path": relative_path, "type": logical_type}
-    # NOTE: Result paths are stored relative to ExperimentManager's project_root (DB parent).
+    # Result paths are stored relative to ExperimentManager's results_path.
     result_files: Dict[str, Dict[str, str]] = field(default_factory=dict)
     processed: bool = field(default=False)
 
@@ -75,8 +74,8 @@ class DataItem:
     channels: Optional[List[str]] = field(default=None)
 
     # Annotated metadata from 'annotations' table
-    condition: Optional[str] = field(default=None)
-    annotated_channels: Optional[List[str]] = field(default=None)
+    annotated_metadata: Optional[Dict] = field(default=None)
+    annotated_channels: Optional[Dict] = field(default=None)
 
     error: Optional[str] = field(default=None)
 
@@ -142,7 +141,7 @@ class DataItem:
         Dict[str, Any]
             A dictionary representation of the item for the 'data' table.
         """
-        return {
+        row = {
             "id": self.id,
             "relative_path": str(self.relative_path),
             "scene": self.scene,
@@ -161,11 +160,13 @@ class DataItem:
             "channels": json.dumps(self.channels)
             if self.channels is not None
             else None,
-            "condition": self.condition,
             "annotated_channels": json.dumps(self.annotated_channels)
             if self.annotated_channels is not None
             else None,
         }
+        if self.annotated_metadata:
+            row.update(self.annotated_metadata)
+        return row
 
     @classmethod
     def from_db_row(
@@ -218,7 +219,10 @@ class DataItem:
             item.channels = json.loads(channels_json)
 
         # Hydrate annotations from JOIN
-        item.condition = data.get("condition")
+        ann_metadata_json = data.get("annotated_metadata")
+        if ann_metadata_json:
+            item.annotated_metadata = json.loads(ann_metadata_json)
+
         ann_channels_json = data.get("annotated_channels")
         if ann_channels_json:
             item.annotated_channels = json.loads(ann_channels_json)

@@ -202,8 +202,8 @@ class ExperimentManager:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS annotations (
                     data_id TEXT NOT NULL,
-                    channels TEXT NOT NULL,
-                    condition TEXT NOT NULL,
+                    channels TEXT,
+                    metadata TEXT,
                     PRIMARY KEY (data_id),
                     FOREIGN KEY (data_id) REFERENCES data(id) ON DELETE CASCADE
                 )
@@ -263,7 +263,7 @@ class ExperimentManager:
         """
         cursor = conn.execute(
             """
-            SELECT d.*, a.condition, a.channels AS annotated_channels
+            SELECT d.*, a.metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
             WHERE d.id = ?
@@ -437,7 +437,7 @@ class ExperimentManager:
 
         try:
             # Find all potential container files
-            glob_iterators = (self.data_dir.glob(f"*{ext}") for ext in extensions)
+            glob_iterators = (self.data_dir.glob(f"**/*{ext}") for ext in extensions)
             all_container_paths = chain.from_iterable(glob_iterators)
 
             # 2. Iterate through container files
@@ -595,8 +595,15 @@ class ExperimentManager:
                     metadata = :metadata,
                     processed = :processed,
                     error = :error,
-                    size_t = :size_t, size_c = :size_c, size_z = :size_z, size_y = :size_y, size_x = :size_x,
-                    scale_t = :scale_t, scale_z = :scale_z, scale_y = :scale_y, scale_x = :scale_x,
+                    size_t = :size_t,
+                    size_c = :size_c,
+                    size_z = :size_z,
+                    size_y = :size_y,
+                    size_x = :size_x,
+                    scale_t = :scale_t,
+                    scale_z = :scale_z,
+                    scale_y = :scale_y,
+                    scale_x = :scale_x,
                     channels = :channels
                 WHERE id = :id
             """,
@@ -623,12 +630,17 @@ class ExperimentManager:
             # 4. Update annotations
             # Fetch existing annotations if any
             existing_annotation = conn.execute(
-                "SELECT condition, channels FROM annotations WHERE data_id = ?",
+                "SELECT metadata, channels FROM annotations WHERE data_id = ?",
                 (item.id,),
             ).fetchone()
 
-            current_condition = (
-                existing_annotation["condition"] if existing_annotation else None
+            current_annotated_metadata_json = (
+                existing_annotation["metadata"] if existing_annotation else None
+            )
+            current_annotated_metadata = (
+                json.loads(current_annotated_metadata_json)
+                if current_annotated_metadata_json
+                else None
             )
             current_annotated_channels_json = (
                 existing_annotation["channels"] if existing_annotation else None
@@ -641,8 +653,10 @@ class ExperimentManager:
 
             # Determine the values to be used for the update
             # If item has a value, use it. Otherwise, retain the existing value.
-            new_condition = (
-                item.condition if item.condition is not None else current_condition
+            new_annotated_metadata = (
+                item.annotated_metadata
+                if item.annotated_metadata is not None
+                else current_annotated_metadata
             )
             new_annotated_channels = (
                 item.annotated_channels
@@ -651,21 +665,23 @@ class ExperimentManager:
             )
 
             # Only proceed if there's something to insert/update for annotations
-            if new_condition is not None or new_annotated_channels is not None:
+            if new_annotated_metadata is not None or new_annotated_channels is not None:
                 conn.execute(
                     """
-                    INSERT INTO annotations (data_id, condition, channels)
+                    INSERT INTO annotations (data_id, metadata, channels)
                     VALUES (?, ?, ?)
                     ON CONFLICT(data_id) DO UPDATE SET
-                        condition=excluded.condition,
+                        metadata=excluded.metadata,
                         channels=excluded.channels
                 """,
                     (
                         item.id,
-                        new_condition,
+                        json.dumps(new_annotated_metadata)
+                        if new_annotated_metadata is not None
+                        else None,
                         json.dumps(new_annotated_channels)
                         if new_annotated_channels is not None
-                        else None,
+                        else json.dumps(item.channels),
                     ),
                 )
             conn.commit()
@@ -692,7 +708,6 @@ class ExperimentManager:
         """
         try:
             item = self.__getitem__(item_id)
-            # FIX: Use self.data_dir as the base for resolving the relative path
             return item.get_absolute_container_path(self.data_dir)
         except KeyError:
             return None
@@ -745,8 +760,8 @@ class ExperimentManager:
             id_placeholders = ",".join(["?"] * len(item_ids))
             result_rows = conn.execute(
                 f"""
-                SELECT data_id, result_type, logical_type, relative_path 
-                FROM results 
+                SELECT data_id, result_type, logical_type, relative_path
+                FROM results
                 WHERE data_id IN ({id_placeholders})
             """,
                 item_ids,
@@ -782,7 +797,7 @@ class ExperimentManager:
         """
         return self._bulk_fetch_items(
             """
-            SELECT d.*, a.condition, a.channels AS annotated_channels
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
         """
@@ -799,7 +814,7 @@ class ExperimentManager:
         # processed = 0 (False)
         return self._bulk_fetch_items(
             """
-            SELECT d.*, a.condition, a.channels AS annotated_channels
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
             WHERE d.processed = 0
@@ -817,7 +832,7 @@ class ExperimentManager:
         # processed =  (False)
         return self._bulk_fetch_items(
             """
-            SELECT d.*, a.condition, a.channels AS annotated_channels
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
             WHERE d.processed = 1
@@ -835,7 +850,7 @@ class ExperimentManager:
         # error IS NOT NULL and processed = 0
         return self._bulk_fetch_items(
             """
-            SELECT d.*, a.condition, a.channels AS annotated_channels
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
             WHERE d.error IS NOT NULL AND d.processed = 0
@@ -843,7 +858,7 @@ class ExperimentManager:
         )
 
     def _update_item_status(self, where_clause: str = "1", message: str = ""):
-        """Generic helper to reset the status of items based on a WHERE clause."""
+        """Reset the status of items based on a WHERE clause."""
         logger.info(f"Updating item status in DB: {message}")
         conn = self._get_connection()
         try:
@@ -904,6 +919,8 @@ class ExperimentManager:
     def to_dataframe(self):
         """Export the experiment as a dataframe.
 
+        Annotated metadata will be added as new columns in the dataframe.
+
         Returns
         -------
         pd.DataFrame
@@ -924,16 +941,23 @@ class ExperimentManager:
         Returns
         -------
         dict
-            Dictionnary with {set:{"channels":, "condition":, "files"}}
+            Dictionnary with {set:{"channels":, "metadata":, "files"}}
         """
-        df = self.to_dataframe()
+        groups = {}
+        for item in self.get_all_items():
+            # Group by the JSON string of channels (since lists aren't hashable)
+            channels_key = (
+                json.dumps(item.channels) if item.channels is not None else "null"
+            )
+            groups.setdefault(channels_key, set()).add(str(item.relative_path))
+
         return {
             f"set{k}": {
-                "channels": ng[0],
-                "condition": "unknown",
-                "files": ng[1]["relative_path"].unique().tolist(),
+                "channels": json.loads(key) if key != "null" else None,
+                "metadata": "unknown",
+                "files": sorted(list(paths)),
             }
-            for k, ng in enumerate(df.groupby("channels"))
+            for k, (key, paths) in enumerate(groups.items())
         }
 
     def export_annotation(self, filepath):
@@ -975,13 +999,19 @@ class ExperimentManager:
 
         # Update items using the information from the annotation dictionary
         for s in data:
-            condition = data[s]["condition"]
+            metadata = data[s]["metadata"]
             channels = data[s]["channels"]
 
-            # Ensure channels is handled as a list/object (it may be JSON string in the YAML)
+            # Ensure channels is handled as a list/object (it may be JSON string)
             if isinstance(channels, str):
                 try:
                     channels = json.loads(channels)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Ensure metadata is handled as a list/object (it may be JSON string)
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
                 except (json.JSONDecodeError, TypeError):
                     pass
 
@@ -990,18 +1020,21 @@ class ExperimentManager:
                 if rel_path in items_by_path:
                     affected_items = items_by_path[rel_path]
                     for item in affected_items:
-                        item.condition = condition
-                        item.annotated_channels = channels
+                        if isinstance(metadata, Dict):
+                            item.annotated_metadata = metadata
+                        if isinstance(channels, Dict):
+                            item.annotated_channels = channels
                         self.update_item(item)
                     logger.info(
-                        f"Updated annotations for {len(affected_items)} items in {rel_path}."
+                        f"Updated annotations for {len(affected_items)} items "
+                        "in {rel_path}."
                     )
 
     def load_item_data(self, item: DataItem) -> xr.DataArray:
         """Load the image data for a DataItem and apply annotations.
 
         This method uses the appropriate Reader to load the specific scene,
-        and then maps the `annotated_channels` and `condition` to the
+        and then maps the `annotated_channels` and `annotated_metadata` to the
         resulting xarray object if they exist.
 
         Parameters
@@ -1043,9 +1076,10 @@ class ExperimentManager:
             else:
                 logger.warning(f"Annotation channel count mismatch for {item.id}")
 
-        # Attach condition to attributes
-        if item.condition:
-            data.attrs["condition"] = item.condition
+        # Attach annotated metadata to attributes
+        if item.annotated_metadata:
+            for k, v in item.annotated_metadata.items():
+                data.attrs[k] = v
 
         return data
 
