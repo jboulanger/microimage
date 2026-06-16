@@ -1,14 +1,22 @@
 set0:
-  channels: '["Ch2-T1", "ChS1-T2", "Ch1-T3"]'
-  condition: unknown
+  channels:
+    - red
+    - blue
+    - green
   files:
-  - 121125_GFP 488_PCNT 647_SunBicD2 FL CC1 new_multiple.lsm
-  - 121125_GFP 488_PCNT 647_SunBicD2 FL new_multiple.lsm
-  - 121125_GFP 488_PCNT 647_SunBicD2 FL Mut1 new_multiple.lsm
+    - 151125_GFP 488_PCNT 555_SunBicD2 FL CC mut new_multiple.lsm
+    - 151125_GFP 488_PCNT 555_SunBicD2 FL Mut1 new_multiple.lsm
+    - 151125_GFP 488_PCNT 555_SunBicD2 FL new_multiple.lsm
+  metadata:
+    condition: WT
 set1:
-  channels: '["ChS1-T1", "Ch1-T2", "Ch2-T2"]'
-  condition: unknown
+  channels:
+    - red
+    - blue
+    - green
   files:
-  - 151125_GFP 488_PCNT 555_SunBicD2 FL CC mut new_multiple.lsm
-  - 151125_GFP 488_PCNT 555_SunBicD2 FL new_multiple.lsm
-  - 151125_GFP 488_PCNT 555_SunBicD2 FL Mut1 new_multiple.lsm
+    - 121125_GFP 488_PCNT 647_SunBicD2 FL CC1 new_multiple.lsm
+    - 121125_GFP 488_PCNT 647_SunBicD2 FL Mut1 new_multiple.lsm
+    - 121125_GFP 488_PCNT 647_SunBicD2 FL new_multiple.lsm
+  metadata:
+    condition: Mutant

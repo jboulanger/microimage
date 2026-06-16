@@ -6,14 +6,6 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 
-# Type hint for the new parser function: takes a Path and returns a list of sub-item
-# data dictionaries.
-# Each dictionary MUST contain at least 'internal_index' and 'metadata'.
-MultiFileParser = Callable[
-    [Path], List[Dict[str, Any]]
-]  # Each dict should contain 'scene' and 'metadata'
-
-
 @dataclass
 class DataItem:
     """

@@ -90,7 +90,7 @@ def show_data(
     data: xr.DataArray,
     channels: List[str],
     cmap: List[str] = ["Reds", "Greens", "Blues", ""],
-    percentiles: Tuple[float] = (0, 100),
+    percentiles: Tuple[float, float] = (0.0, 100.0),
     gamma: float = 1.0,
     ax=None,
 ):

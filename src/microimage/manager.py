@@ -13,7 +13,7 @@ import numpy as np
 import xarray as xr
 import yaml
 
-from .models import DataItem, MultiFileParser
+from .models import DataItem
 from .readers import BaseReader, Reader
 from .results import Contours, Mask, Result, Table, Thumbnail
 from .utils import inspect_data, show_contours, show_data, show_points, show_scalebar
@@ -395,11 +395,7 @@ class ExperimentManager:
 
         return dims_meta
 
-    def add_file(
-        self,
-        container_path: Path | str,
-        multi_file_parser: MultiFileParser | None = None,
-    ):
+    def add_file(self, container_path: Path | str):
         """Add a single image container.
 
         Note the file as to in the project folder... is this good?
@@ -415,9 +411,7 @@ class ExperimentManager:
         logger.info(f"Adding scene in file {container_path}")
         try:
             conn = self._get_connection()
-            new_items_count = self._process_container_file(
-                Path(container_path), conn, multi_file_parser
-            )
+            new_items_count = self._process_container_file(Path(container_path), conn)
             conn.commit()
             if new_items_count > 0:
                 logger.info(
@@ -436,9 +430,7 @@ class ExperimentManager:
             conn.close()
 
     def scan_data_directory(
-        self,
-        extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"],
-        multi_file_parser: MultiFileParser = None,
+        self, extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"]
     ):
         """Scan the data directory for new files and register them.
 
@@ -450,10 +442,6 @@ class ExperimentManager:
         ----------
         extensions : List[str], optional
             A list of file extensions to look for, by default [".lsm", ".nd2", ".czi", ".lif"].
-        multi_file_parser : MultiFileParser, optional
-            A callable that takes a file `Path` and returns a list of dicts,
-            one for each sub-item (e.g., scene) in the file. If not provided,
-            each file is treated as a single item.
 
         """
         logger.info(f"Scanning {self.data_dir} for new files...")
@@ -475,9 +463,7 @@ class ExperimentManager:
                     continue
 
                 # Delegate processing of each file to a helper method
-                new_items_count = self._process_container_file(
-                    container_path, conn, multi_file_parser
-                )
+                new_items_count = self._process_container_file(container_path, conn)
                 found_new_items += new_items_count
 
             conn.commit()
@@ -518,31 +504,25 @@ class ExperimentManager:
         self,
         container_path: Path,
         conn: sqlite3.Connection,
-        multi_file_parser: Optional[MultiFileParser],
     ) -> int:
         """Process a single image container file, adding items to the DB."""
         relative_path = container_path.relative_to(self.data_dir)
         items_data_list = []
         new_items_count = 0
 
-        # Use the provided parser or the default Reader to get scene information
-        if multi_file_parser:
-            logger.debug(f"Using parser to analyze file: {container_path.name}")
-            items_data_list = multi_file_parser(container_path)
-        else:
-            try:
-                with Reader(container_path) as reader:
-                    for i, scene in enumerate(reader):
-                        logger.debug(f"Adding {container_path} scene [{i}]")
-                        items_data_list.append(
-                            {
-                                "scene": str(i),
-                                "_scene_xarray": scene,
-                            }
-                        )
-            except Exception as e:
-                logger.warning(f"Could not read {container_path.name}: {e}")
-                return 0
+        try:
+            with Reader(container_path) as reader:
+                for i, scene in enumerate(reader):
+                    logger.debug(f"Adding {container_path} scene [{i}]")
+                    items_data_list.append(
+                        {
+                            "scene": str(i),
+                            "_scene_xarray": scene,
+                        }
+                    )
+        except Exception as e:
+            logger.warning(f"Could not read {container_path.name}: {e}")
+            return 0
 
         # Process each sub-item (scene) from the file
         for item_data in items_data_list:
