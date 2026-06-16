@@ -1,70 +1,80 @@
-## Project Overview
-Python file management tool high-throughput microscopy pipelines where standardizing metadata and handling large multi-dimensional images are critical.
+# Software Development Principles
 
-## Code Conventions
-- numpy docstring documentation
-- src based project
+Welcome to the core development manifesto for the microimage project. Research Software Engineering (RSE) requires balancing rigorous engineering practices with the fluid, exploratory nature of scientific discovery. 
 
-## Directory Structure
-- src/microimage/ — python module
-- test — shared UI components
-- examples — use cases notebooks and example scripts
+This document defines the core principles, environment constraints, and technical stack ensuring our software is scientifically sound, reproducible, and maintainable.
 
-## Important Constraints
-- Write code that is straightforward to read and understand, prioritizing clarity
-- Only build features that are required right now 
-- Break the code into decoupled, cohesive components
+---
 
-## Tooling
-- use ruff for code formating
-- use uv for managing environment
-- use pytest for testing
+## 1. Project Stack
+All AI assistants and developers must strictly adhere to the project's defined tech stack and version constraints. Do not introduce unlisted core dependencies without explicit confirmation.
 
-## Use cases
-1. Basic usage
-    - Define a data folder (containing image files) a result folder and a database location. 
-    - List files in the data folder 
-    - Add user defined metadata: conditions and channel semantic mapping is important
-2. Processing
-    - Load an experiment database
-    - Process all items with a user defined processing callable.
+### Tech Stack Matrix
+| Component | Technology | Target Version | Purpose / Scope |
+| :--- | :--- | :--- | :--- |
+| **Runtime & Tooling** | Python via `uv` | `3.12.x` | Unified runtime, environment, and lockfile manager. |
+| **Array** | xarray/dask | `^2025.11` | Multi-dimensional array |
+| **Data Storage** | sqlite | `3` | Local database. |
+| **Testing** | pytest | `^7.4` | Automated unit, integration, and regression tests. |
 
-## Database Schema
-The project uses a SQLite database to track images, annotation, and processing results.
+### Environment Setup & Agent Commands
+AI agents must use `uv` syntax to execute project tasks without manual environment activation loops:
 
-### `data` Table
-Stores core information and dimensional metadata for each scene.
+* **Initialize/Sync Project:** `uv sync`
+* **Add a New Dependency:** `uv add <package>`
+* **Run Test Suite:** `uv run pytest tests/`
+* **Run Code Linter:** `uv run ruff check src/`
 
-| Column | Type | Description |
+---
+
+## 2. Reproducibility & Verifiability
+In scientific software, correctness and reproducibility are paramount. A result that cannot be replicated is not a scientific result.
+
+* **Deterministic Execution:** Avoid or carefully control sources of non-determinism (e.g., random number generator seeds, parallel race conditions). Always explicitly set seeds in numerical modules.
+* **Environment As Code:** The exact execution environment must be versioned. 
+* **Provenance Tracking:** Ensure output data products are automatically tagged with the software version, configuration parameters, and raw data inputs used to generate them.
+
+---
+
+## 3. Computational Correctness & Testing
+Unlike commercial software where a bug might crash a page, a bug in scientific software can quietly corrupt data and lead to false scientific conclusions.
+
+### Testing Scientific Code
+* **Analytical Verification:** Test your algorithms against known analytical or exact solutions for simplified baseline cases.
+* **Regression Testing for Data:** Maintain a suite of "golden data" inputs and outputs to ensure optimizations or refactors do not unexpectedly alter scientific results.
+* **Edge-Case Validation:** Actively test bounds, zero-cases, and invalid physical parameters (e.g., negative mass or absolute temperature below $0\text{ K}$).
+* **Test data strategy** Original test data in the `data` folder are used for testing.
+
+| Test Category | Target | Objective |
 | :--- | :--- | :--- |
-| `id` | TEXT | Primary Key. Unique SHA1 hash based on file name, modification time, and scene index. |
-| `relative_path` | TEXT | Path to the container file relative to the data directory. |
-| `scene` | TEXT | Index or name of the scene within the container file. |
-| `metadata` | TEXT | JSON string of arbitrary metadata extracted from the file. |
-| `processed` | INTEGER | Boolean flag (0 or 1) indicating if the item has been processed. |
-| `error` | TEXT | Error message if processing failed. |
-| `size_t, size_c, ...` | INTEGER | Dimensional sizes (T, C, Z, Y, X). |
-| `scale_t, scale_z, ...` | REAL | Physical scaling/calibration for dimensions. |
-| `channels` | TEXT | JSON list of channel names. |
+| **Integration** | Data processing pipelines | Ensure smooth data flow from ingestion to output. |
+| **Numerical Stability** | Floating-point operations | Detect precision loss, underflow, or overflow. |
 
-### `annotation` Table
-Stores user annotations providing semantic channel names and information on experimental setting (condition, runs, etc)
+---
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `data_id` | TEXT | Foreign Key referencing `data.id`. |
-| `channels` | TEXT | JSON list of channel names. |
-| `metadata` | TEXT | JSON string of arbitrary metadata.|
+## 4. Data Integrity & Interoperability
+Data is the lifeblood of science. Our software must treat data with strict stewardship.
 
-*Primary Key is `(data_id)`.*
+* **Open Standard Formats:** Favor widely accepted scientific formats (e.g., HDF5, NetCDF, Parquet, JSON) over proprietary or custom binary formats to avoid vendor lock-in.
+* **Immutability:** Raw data inputs must be treated as strictly read-only. Intermediate and final outputs should be written to separate directories.
+* **Metadata Richness:** Self-documenting datasets are preferred. We use xarray to insure that data axes are labelled.
+* **Image I/O conventions** Microscopy data are normalized to TCZYX axes order. 
+* **Database access** The access is coordinated by the experiment manager only.
 
-### `results` Table
-Tracks output files generated during processing.
+---
 
-| Column | Type | Description |
-| :--- | :--- | :--- |
-| `data_id` | TEXT | Foreign Key referencing `data.id`. |
-| `result_type` | TEXT | Identifier for the type of result (e.g., "thumbnail", "mask"). |
-| `relative_path` | TEXT | Path to the result file relative to the project root. |
+## 5. Code Accessibility & Open Science (FAIR)
+We align our development practices with the FAIR principles: **F**indable, **A**ccessible, **I**nteroperable, and **R**eusable.
 
-*Primary Key is a composite of `(data_id, result_type)`.*
+* **Documentation is a Deliverable:** Code without documentation is unusable. Every core algorithm must document its assumptions, physical limitations, and citations to the original scientific literature.
+* **Permissive Licensing:** Default to open-source licenses (e.g., MIT, BSD-3-Clause, or Apache 2.0) to encourage community collaboration and academic reuse.
+
+---
+
+## 6. Pragmatic Performance Optimization
+Scientific computing often demands high performance, but premature optimization can introduce bugs and hurt readability.
+
+* **Profile Before Optimizing:** Never optimize based on intuition. Use profiling tools (like `cProfile` or `line_profiler`) to identify actual computational bottlenecks.
+* **Prototype First, Optimize Later:** Write clean, high-level code to verify scientific validity first. Delegate performance-critical bottlenecks to compiled languages or highly optimized libraries only when proven necessary.
+* **Maintainability > Micro-optimizations:** Do not trade code clarity for negligible performance gains.
+

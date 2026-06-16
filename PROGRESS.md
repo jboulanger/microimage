@@ -1,7 +1,7 @@
 # Project Progress - microimage
 
 ## Overview
-Status of the `microimage` library implementation according to the specifications in `GEMINI.md`.
+Status of the `microimage` library implementation according to the specifications in `AGENTS.md`.
 
 ## Core Features
 
@@ -29,18 +29,18 @@ Status of the `microimage` library implementation according to the specification
 ### 3. Processing Framework (`src/microimage/processor.py`)
 - [x] Dask-compatible worker task wrapper.
 - [x] Database synchronization from worker processes.
-- [ ] High-level pipeline orchestration in `ExperimentManager`.
+- [x] High-level pipeline orchestration in `ExperimentManager`.
 
-### 4. Image Writing (`src/microimage/writers.py`)
-- [ ] Abstract `BaseWriter` interface (Partially implemented).
-- [ ] Writer factory (`Writer`).
-- [ ] Concrete implementations (e.g., `TIFFWriter`).
+### 4. Writing (`src/microimage/writers.py`)
+- [x] Abstract `BaseWriter` interface (Partially implemented).
+- [x] Writer factory (`Writer`).
+- [x] Concrete implementations (e.g., `TIFFWriter`, `CSVWriter`, `YOLOWriter`).
 
 ## Directory Structure & Tooling
 - [x] `src/` based layout.
 - [x] `uv` for environment management (`uv.lock` present).
 - [x] `pytest` for testing (tests present in `test/`).
-- [ ] `examples/` directory for notebooks and scripts.
+- [x] `examples/` directory for notebooks and scripts.
 - [x] `ruff` for formatting (assumed usage per constraints).
 
 ## Use Cases Implementation Status
@@ -52,3 +52,4 @@ Status of the `microimage` library implementation according to the specification
 - Comprehensive reader support for major microscopy formats.
 - SQLite-backed experiment manager implementation.
 - Basic Dask processing wrapper.
+

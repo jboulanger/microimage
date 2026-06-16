@@ -1,13 +1,15 @@
 # Microimage
 
-Microimage reduces boilerplate code when developing analysis workflows for light microscopy images. It provides dataset management, unified image readers and writers built on xarray, and a batch processing framework.
+Microimage reduces boilerplate when developing analysis workflows for light microscopy. It provides dataset management, unified image readers and writers built on [xarray](https://docs.xarray.dev/), and a batch processing framework.
 
-The fundamental unit of the library is a **scene**: a spatial position within a dataset, to which results and annotations are attached.
+The fundamental unit of the library is a **scene**: a single physical position within a dataset to which results and annotations are attached.
 
 ## Installation
 
 ```bash
-uv install microimage
+pip install microimage
+# or using uv
+uv add microimage
 ```
 
 ## Data Organization
@@ -52,7 +54,7 @@ Populated during directory scanning. Contains one row per scene (physical positi
 | `scale_t, scale_z, ...` | REAL | Physical scale/calibration values for each dimension. |
 | `channels` | TEXT | JSON list of channel names as extracted from the file. |
 
-> **Note:** The `id` is computed from the file name and modification time. Renaming or modifying a file will generate a new ID, breaking the link to any existing results.
+> **Note:** The id is computed at scan time from the file name, modification time, and scene index. If a file is renamed or modified and the directory is rescanned, a new ID will be generated, breaking the link to any existing results. Avoid rescanning after files have been processed.
 
 ### `annotation` Table
 
@@ -81,7 +83,7 @@ Populated during processing. Tracks output files generated for each scene, one r
 ## Usage
 
 - **Readers** load data and metadata from various file formats as xarrays with labelled axes.
-- The **ExperimentManager** organises the dataset and provides unified access using semantic channel names. It is responsible for scanning the data folder and populating the data table. When files are multi-scene containers, each scene in the container is handled as a single object and its properties stored in the data table as a single row. In short the atomic unit is the scene and not the file.
+- The **ExperimentManager** organizes the dataset and provides unified access using semantic channel names. It is responsible for scanning the data folder and populating the data table. When files are multi-scene containers, each scene in the container is handled as a single object and its properties stored in the data table as a single row. In short the atomic unit is the scene and not the file.
 - **Annotations** are applied in bulk by editing and re-importing the YAML annotation file.
 - **Batch processing** is done via `apply(exp, process, client)`, where `process` has the signature `def process(item: DataItem, data: xr.DataArray) -> Dict[str, Result]`. Any exception raised inside `process` is caught, logged to the `error` column, and the scene is left as unprocessed — enabling safe partial reruns. On success, the scene is flagged as `processed=1`. Results are written to disk automatically based on their type: `Table` is saved as CSV, `Contours` as a text file, etc.
 
@@ -102,6 +104,11 @@ exp.scan_data_directory([".czi", ".lsm", ".nd2"])
 exp.export_annotation("annotation.yml")
 exp.import_annotation("annotation.yml")
 
+# Visualize a scene in a notebook
+item = exp.get_all_items()[0]
+exp.show_image(item,["NUCLEI","MEMBRANE"],["blue","green"])
+exp.show_scalebar()
+
 # Define a processing function
 def process(item, data):
     return {"table": Table(), "labels": Contours()}
@@ -112,6 +119,12 @@ client = Client(cluster)
 print(f"Dask dashboard: {client.dashboard_link}")
 
 microimage.apply(exp, process, client)
+
+# Inspect results
+item = exp.get_all_items()[0]
+exp.show_image(item,["NUCLEI","MEMBRANE"],["blue","green"])
+exp.show_contours(item)
+exp.show_scalebar()
 ```
 
 ## Supported File Formats

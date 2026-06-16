@@ -204,7 +204,7 @@ class ExperimentManager:
                     data_id TEXT NOT NULL,
                     channels TEXT,
                     metadata TEXT,
-                    PRIMARY KEY (data_id),
+                    PRIMARY KEY (data_id) ON CONFLICT REPLACE,
                     FOREIGN KEY (data_id) REFERENCES data(id) ON DELETE CASCADE
                 )
             """)
@@ -395,7 +395,11 @@ class ExperimentManager:
 
         return dims_meta
 
-    def add_file(self, file_path: Path | str, metadata: dict[Any]):
+    def add_file(
+        self,
+        container_path: Path | str,
+        multi_file_parser: MultiFileParser | None = None,
+    ):
         """Add a single image container.
 
         Note the file as to in the project folder... is this good?
@@ -408,7 +412,28 @@ class ExperimentManager:
             Additional metadata as a dictionnary
 
         """
-        pass
+        logger.info(f"Adding scene in file {container_path}")
+        try:
+            conn = self._get_connection()
+            new_items_count = self._process_container_file(
+                Path(container_path), conn, multi_file_parser
+            )
+            conn.commit()
+            if new_items_count > 0:
+                logger.info(
+                    f"Successfully registered {new_items_count} new items/sub-items."
+                )
+            else:
+                logger.info("No new files or sub-items found.")
+        except sqlite3.Error as e:
+            logger.error(f"Database Scan Error: {e}")
+            conn.rollback()
+        except Exception as e:
+            # Catch errors originating from the parser function
+            logger.error(f"File Parser Error during scan: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
 
     def scan_data_directory(
         self,
@@ -433,14 +458,14 @@ class ExperimentManager:
         """
         logger.info(f"Scanning {self.data_dir} for new files...")
         conn = self._get_connection()
-        found_new_files = 0
+        found_new_items = 0
 
         try:
             # Find all potential container files
             glob_iterators = (self.data_dir.glob(f"**/*{ext}") for ext in extensions)
             all_container_paths = chain.from_iterable(glob_iterators)
 
-            # 2. Iterate through container files
+            # Iterate through container files
             for container_path in all_container_paths:
                 # Skip hidden resource files (e.g., Mac OS ._ files)
                 if container_path.name.startswith("._"):
@@ -453,12 +478,12 @@ class ExperimentManager:
                 new_items_count = self._process_container_file(
                     container_path, conn, multi_file_parser
                 )
-                found_new_files += new_items_count
+                found_new_items += new_items_count
 
             conn.commit()
-            if found_new_files > 0:
+            if found_new_items > 0:
                 logger.info(
-                    f"Successfully registered {found_new_files} new items/sub-items."
+                    f"Successfully registered {found_new_items} new items/sub-items."
                 )
             else:
                 logger.info("No new files or sub-items found.")
