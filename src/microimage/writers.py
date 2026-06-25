@@ -152,10 +152,11 @@ class Writer:
 
     >>> from microimage import Writer
     >>> with Reader("image.tif) as f:
-    >>>     f.write_scene()
+    >>>     f.write(data)
     """
 
     def __new__(cls, path: Path, *args, **kwargs) -> BaseWriter:
+        """Inialize a writer based on the file extension."""
         path = Path(path)
         ext = path.suffix.lower()
         writer_class = WRITER_REGISTRY.get(ext)

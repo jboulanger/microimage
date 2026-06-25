@@ -78,3 +78,6 @@ Scientific computing often demands high performance, but premature optimization 
 * **Prototype First, Optimize Later:** Write clean, high-level code to verify scientific validity first. Delegate performance-critical bottlenecks to compiled languages or highly optimized libraries only when proven necessary.
 * **Maintainability > Micro-optimizations:** Do not trade code clarity for negligible performance gains.
 
+
+## 7. Code iteration
+* **Atomic changes** Fix only one problem at a time. Do not modify code adjacent to the issue being addressed. 

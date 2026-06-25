@@ -32,6 +32,13 @@ class Table(Result):
         super().__init__(data, "table", ".csv")
 
 
+class Parameters(Result):
+    """Represents processing parameters (usually saved as .yaml)."""
+
+    def __init__(self, data: Any):
+        super().__init__(data, "parameters", ".yml")
+
+
 class Contours(Result):
     """Represents object contours (usually saved as YOLO .txt)."""
 

@@ -430,7 +430,9 @@ class ExperimentManager:
             conn.close()
 
     def scan_data_directory(
-        self, extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"]
+        self,
+        extensions: List[str] = [".png", ".jpg", ".jpeg", ".tif"],
+        subfolder: str | None = None,
     ):
         """Scan the data directory for new files and register them.
 
@@ -442,15 +444,22 @@ class ExperimentManager:
         ----------
         extensions : List[str], optional
             A list of file extensions to look for, by default [".lsm", ".nd2", ".czi", ".lif"].
+        subfolder: str | None
+            A path to a subfolder relative to the datadir.
 
         """
         logger.info(f"Scanning {self.data_dir} for new files...")
         conn = self._get_connection()
         found_new_items = 0
 
+        if subfolder is None:
+            folder = Path(self.data_dir)
+        else:
+            folder = Path(self.data_dir) / subfolder
+
         try:
             # Find all potential container files
-            glob_iterators = (self.data_dir.glob(f"**/*{ext}") for ext in extensions)
+            glob_iterators = (Path(folder).glob(f"**/*{ext}") for ext in extensions)
             all_container_paths = chain.from_iterable(glob_iterators)
 
             # Iterate through container files
@@ -589,6 +598,7 @@ class ExperimentManager:
             The `DataItem` object to update in the database.
 
         """
+
         conn = self._get_connection()
         try:
             row = item.to_data_row()
@@ -1027,12 +1037,12 @@ class ExperimentManager:
                     for item in affected_items:
                         if isinstance(metadata, Dict):
                             item.annotated_metadata = metadata
-                        if isinstance(channels, Dict):
+                        if isinstance(channels, list):
                             item.annotated_channels = channels
                         self.update_item(item)
                     logger.info(
                         f"Updated annotations for {len(affected_items)} items "
-                        "in {rel_path}."
+                        f"in {rel_path}."
                     )
 
     def load_item_data(self, item: DataItem) -> xr.DataArray:
