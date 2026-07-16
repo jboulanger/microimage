@@ -233,7 +233,7 @@ def show_scalebar(xmin, xmax, ymin, ymax, color="white", ax=None):
     )
 
 
-def show_contours(shape, data, ax=None):
+def show_contours(shape, data, ax=None, **kwargs):
     """Plot the segmentation contours.
 
     Parameters
@@ -242,6 +242,10 @@ def show_contours(shape, data, ax=None):
         Height and width to rescale the normalized data
     data: numpy.ndarray
         Normalize contours coordinates
+    ax:  matplotlib.pyplot.Axes | None
+        matplotlib axes
+    kwargs:
+        Keywords passed to ax.plot()
     """
     if ax is None:
         ax = plt.gca()
@@ -258,8 +262,7 @@ def show_contours(shape, data, ax=None):
         ax.plot(
             np.append(x_pixels, x_pixels[0]),
             np.append(y_pixels, y_pixels[0]),
-            linewidth=2,
-            alpha=0.7,
+            **kwargs,
         )
 
 

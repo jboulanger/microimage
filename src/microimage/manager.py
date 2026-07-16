@@ -818,6 +818,24 @@ class ExperimentManager:
         """
         )
 
+    def get_item_by_id(self, id) -> List[DataItem]:
+        """Return the item.
+
+        Returns
+        -------
+        List[DataItem]
+            A list of all `DataItem` objects where the `error` field is not NULL.
+        """
+        # error IS NOT NULL and processed = 0
+        return self._bulk_fetch_items(
+            f"""
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
+            FROM data d
+            LEFT JOIN annotations a ON d.id = a.data_id
+            WHERE d.id is '{id}'
+        """
+        )
+
     def get_unprocessed_items(self) -> List[DataItem]:
         """Return a list of all items not yet marked as processed.
 
@@ -1272,7 +1290,7 @@ class ExperimentManager:
         data = self.load_item_data(item)
         inspect_data(data, ax)
 
-    def show_contours(self, item, name, ax=None):
+    def show_contours(self, item, name, ax=None, **kwargs):
         """Show segmentation contours.
 
         Parameters
@@ -1285,6 +1303,7 @@ class ExperimentManager:
             [float(item.size_y) * item.scale_y, float(item.size_x) * item.scale_x],
             contours.data,
             ax,
+            **kwargs,
         )
 
     def show_points(self, item, name, columns=None, ax=None, **kwargs):
