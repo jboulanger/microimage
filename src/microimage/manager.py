@@ -1044,20 +1044,22 @@ class ExperimentManager:
                 for m in item.annotated_metadata:
                     d[m] = item.annotated_metadata[m]
 
-            # Insert annotated channels
+            # Insert annotated channels in columns with the name of the channel
             if item.annotated_channels is not None:
                 if isinstance(item.annotated_channels, dict):
                     ann_dict = {
                         c: item.annotated_channels.get(c, c) for c in item.channels
                     }
                 else:
-                    ann_dict = {k: v in zip(item.channels, item.annotated_channels)}
-                for k, v in ann_dict:
-                    d[k] = v
+                    ann_dict = {
+                        k: v for k, v in zip(item.channels, item.annotated_channels)
+                    }
+                for k, v in ann_dict.items():
+                    d[f"Channel {k}"] = v
             else:
                 # Insert original channels
                 for v in item.channels:
-                    d[v] = v
+                    d[f"Channel {v}"] = v
             df.append(d)
 
         return pd.DataFrame.from_records(df, index="id")
@@ -1085,12 +1087,13 @@ class ExperimentManager:
 
             # 3. Handle annotated_channels as a list
             channels_count = len(item.channels)
-            channel_keys = [f"channel_{k}" for k in range(channels_count)]
+            channel_keys = [f"Channel {c}" for c in item.channels]
 
-            # Populate or overwrite list values
-            ann_list = [row_data[key] for key in channel_keys if key in row_data]
+            # Populate or overwrite values directly using channel column names
             item.annotated_channels = {
-                orig: ann for orig, ann in zip(item.channels, ann_list)
+                c: row_data[f"Channel {c}"]
+                for c in item.channels
+                if f"Channel {c}" in row_data
             }
 
             # 4. Handle remaining metadata

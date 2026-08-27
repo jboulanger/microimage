@@ -70,7 +70,7 @@ def test_annotations():
 
         # 3. Test convert_annotation_to_dataframe
         df = manager.convert_annotation_to_dataframe()
-        assert df.loc["test_image.czi:0", "channel_0"] == "DAPI_Nuclei"
-        assert df.loc["test_image.czi:0", "channel_1"] == "GFP_Signal"
-        assert df.loc["test_image.czi:0", "channel_2"] == "RFP"
+        assert df.loc["test_image.czi:0", "Channel DAPI"] == "DAPI_Nuclei"
+        assert df.loc["test_image.czi:0", "Channel GFP"] == "GFP_Signal"
+        assert df.loc["test_image.czi:0", "Channel RFP"] == "RFP"
         assert df.loc["test_image.czi:0", "condition"] == "treated"
