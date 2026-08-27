@@ -162,8 +162,10 @@ class ExperimentManager:
         logger.info(f"Initializing database at {self.db_path}...")
         conn = self._get_connection()
         try:
-            # Enable WAL mode for better concurrency
-            conn.execute("PRAGMA journal_mode=WAL;")
+            # Ensure we do not use Write ahead logging
+            # as WAL does not work over a network filesystem
+            # https://www.sqlite.org/wal.html
+            conn.execute("PRAGMA journal_mode=DELETE;")
 
             # Table for main data
             conn.execute("""
@@ -263,7 +265,7 @@ class ExperimentManager:
         """
         cursor = conn.execute(
             """
-            SELECT d.*, a.metadata, a.channels AS annotated_channels
+            SELECT d.*, a.metadata AS annotated_metadata, a.channels AS annotated_channels
             FROM data d
             LEFT JOIN annotations a ON d.id = a.data_id
             WHERE d.id = ?
@@ -598,7 +600,6 @@ class ExperimentManager:
             The `DataItem` object to update in the database.
 
         """
-
         conn = self._get_connection()
         try:
             row = item.to_data_row()
@@ -982,16 +983,128 @@ class ExperimentManager:
             channels_key = (
                 json.dumps(item.channels) if item.channels is not None else "null"
             )
-            groups.setdefault(channels_key, set()).add(str(item.relative_path))
+            groups.setdefault(channels_key, {"paths": set(), "items": []})
+            groups[channels_key]["paths"].add(str(item.relative_path))
+            groups[channels_key]["items"].append(item)
 
-        return {
-            f"set{k}": {
-                "channels": json.loads(key) if key != "null" else None,
+        result_dict = {}
+        for k, (key, group_data) in enumerate(groups.items()):
+            paths = group_data["paths"]
+            items = group_data["items"]
+
+            channels_dict = {}
+            orig_channels = json.loads(key) if key != "null" else None
+
+            if orig_channels:
+                channels_dict = {c: c for c in orig_channels}
+                for item in items:
+                    if item.annotated_channels:
+                        if isinstance(item.annotated_channels, dict):
+                            channels_dict.update(item.annotated_channels)
+                            break
+                        elif isinstance(item.annotated_channels, list):
+                            for orig, ann in zip(
+                                orig_channels, item.annotated_channels
+                            ):
+                                channels_dict[orig] = ann
+                            break
+            else:
+                channels_dict = None
+
+            result_dict[f"set{k}"] = {
+                "channels": channels_dict,
                 "metadata": "unknown",
                 "files": sorted(list(paths)),
             }
-            for k, (key, paths) in enumerate(groups.items())
-        }
+        return result_dict
+
+    def convert_annotation_to_dataframe(self):
+        """Convert the annotation to a dataframe for export.
+
+        One might prefer a csv file for annotation which is more rigid than the YAML.
+
+        Returns
+        -------
+        pd.Dataframe:
+            Table with a row per scene with id, relative_path, channels and annotated
+            metadata as individual columns.
+        """
+        import pandas as pd
+
+        df = []
+        for item in self:
+            d = {
+                "id": item.id,
+                "relative_path": item.relative_path,
+                "scene": item.scene,
+            }
+
+            # Insert metadata
+            if item.annotated_metadata is not None:
+                for m in item.annotated_metadata:
+                    d[m] = item.annotated_metadata[m]
+
+            # Insert annotated channels
+            if item.annotated_channels is not None:
+                if isinstance(item.annotated_channels, dict):
+                    ann_dict = {
+                        c: item.annotated_channels.get(c, c) for c in item.channels
+                    }
+                else:
+                    ann_dict = {k: v in zip(item.channels, item.annotated_channels)}
+                for k, v in ann_dict:
+                    d[k] = v
+            else:
+                # Insert original channels
+                for v in item.channels:
+                    d[v] = v
+            df.append(d)
+
+        return pd.DataFrame.from_records(df, index="id")
+
+    def update_annotation_from_dataframe(self, df):
+        """Update annotations from a dataframe.
+
+        Parameter
+        ---------
+        df: pd.DataFrame
+            Dataframe with relative_path, scene, channel_k and extra columns used to add
+            annotation.
+        """
+        # 1. Map all items by their ID for O(1) batch lookup
+        items_by_id = {item.id: item for item in self.get_all_items()}
+
+        # Static columns to exclude from extra metadata
+        base_exclude = {"relative_path", "scene"}
+
+        # 2. Iterate using to_dict for fast row access
+        for row_id, row_data in df.to_dict(orient="index").items():
+            item = items_by_id.get(row_id)
+            if item is None:
+                continue
+
+            # 3. Handle annotated_channels as a list
+            channels_count = len(item.channels)
+            channel_keys = [f"channel_{k}" for k in range(channels_count)]
+
+            # Populate or overwrite list values
+            ann_list = [row_data[key] for key in channel_keys if key in row_data]
+            item.annotated_channels = {
+                orig: ann for orig, ann in zip(item.channels, ann_list)
+            }
+
+            # 4. Handle remaining metadata
+            if item.annotated_metadata is None:
+                item.annotated_metadata = {}
+
+            exclude_cols = base_exclude.union(channel_keys)
+
+            # Assign remaining columns to metadata
+            for col, val in row_data.items():
+                if col not in exclude_cols:
+                    item.annotated_metadata[col] = val
+
+            self.update_item(item)
 
     def export_annotation(self, filepath):
         """Save the data table to a yaml for user annotation.
@@ -1055,7 +1168,7 @@ class ExperimentManager:
                     for item in affected_items:
                         if isinstance(metadata, Dict):
                             item.annotated_metadata = metadata
-                        if isinstance(channels, list):
+                        if isinstance(channels, (list, dict)):
                             item.annotated_channels = channels
                         self.update_item(item)
                     logger.info(
@@ -1104,8 +1217,12 @@ class ExperimentManager:
 
         # Apply annotated channel names if they exist and match the count
         if item.annotated_channels:
-            if "C" in data.dims and len(item.annotated_channels) == data.sizes["C"]:
-                data.coords["C"] = item.annotated_channels
+            if isinstance(item.annotated_channels, dict):
+                ann_list = [item.annotated_channels.get(c, c) for c in item.channels]
+            else:
+                ann_list = item.annotated_channels
+            if "C" in data.dims and len(ann_list) == data.sizes["C"]:
+                data.coords["C"] = ann_list
             else:
                 logger.warning(f"Annotation channel count mismatch for {item.id}")
 
