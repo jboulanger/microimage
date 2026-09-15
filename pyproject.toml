@@ -1,6 +1,6 @@
 [project]
 name = "microimage"
-version = "0.1.0"
+version = "0.1.1"
 description = "Management of microscopy image analysis project"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -9,14 +9,14 @@ dependencies = [
     "pylibczirw",
     "tifffile",
     "ome-types",
-    "xarray",
     "ipykernel>=7.1.0",
     "ipywidgets>=8.1.8",
-    "liffile",
     "imaris-ims-file-reader>=0.1.8",
+    "liffile",
     "slideio>=2.7.4",
     "scikit-image>=0.25.2",
     "matplotlib>=3.11.0",
+    "xarray",
 ]
 
 [project.optional-dependencies]

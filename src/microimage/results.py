@@ -1,9 +1,15 @@
-"""Data models for processing results."""
+"""Data models for processing results.
+
+These classes enable to define saving methods depending on the logical types.
+The actual saving is defined by the Writers in writers.py.
+"""
 
 from dataclasses import dataclass
 from typing import Any
+
 import numpy as np
 import xarray as xr
+
 from .utils import mask_to_yolo_contours
 
 
@@ -26,7 +32,7 @@ class Mask(Result):
 class Table(Result):
     """Represents tabular data (usually saved as .csv)."""
 
-    ext: str = ".tif"
+    ext: str = ".csv"
 
     def __init__(self, data: Any):
         super().__init__(data, "table", ".csv")
@@ -35,12 +41,16 @@ class Table(Result):
 class Parameters(Result):
     """Represents processing parameters (usually saved as .yaml)."""
 
+    ext: str = ".yml"
+
     def __init__(self, data: Any):
         super().__init__(data, "parameters", ".yml")
 
 
 class Contours(Result):
     """Represents object contours (usually saved as YOLO .txt)."""
+
+    ext: str = ".txt"
 
     def __init__(self, data: Any, class_index: int = 0):
         super().__init__(data, "contours", ".txt")
@@ -51,6 +61,8 @@ class Contours(Result):
 
 class Thumbnail(Result):
     """Represents a visualization or thumbnail (usually saved as .jpg)."""
+
+    ext: str = ".jpg"
 
     def __init__(self, data: Any):
         super().__init__(data, "thumbnail", ".jpg")

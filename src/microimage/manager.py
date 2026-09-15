@@ -134,6 +134,7 @@ class ExperimentManager:
         conn = sqlite3.connect(
             self.db_path, timeout=10.0
         )  # Set a high timeout for concurrency
+        conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.row_factory = dict_factory
         return conn
@@ -1070,8 +1071,18 @@ class ExperimentManager:
         Parameter
         ---------
         df: pd.DataFrame
-            Dataframe with relative_path, scene, channel_k and extra columns used to add
+            Dataframe with relative_path, scene, `channel ChannelName` and extra columns used to add
             annotation.
+
+        Raise
+        -----
+        ValueError if the dataframe has no 'id' column.
+
+        Example
+        -------
+        >>> import pandas as pd
+        >>> annot_df = pd.read_csv("scan-annot.csv", index_col="id")
+        >>> exp.update_annotation_from_dataframe(annot_df)
         """
         # 1. Map all items by their ID for O(1) batch lookup
         items_by_id = {item.id: item for item in self.get_all_items()}
@@ -1081,18 +1092,23 @@ class ExperimentManager:
 
         # 2. Iterate using to_dict for fast row access
         for row_id, row_data in df.to_dict(orient="index").items():
-            item = items_by_id.get(row_id)
+            if df.index.name == "id":
+                item = items_by_id.get(row_id)
+            elif "id" in df.columns:
+                item = items_by_id.get(row_data["id"])
+            else:
+                raise ValueError("The dataframe has not valid column 'id'.")
             if item is None:
                 continue
 
             # 3. Handle annotated_channels as a list
-            channels_count = len(item.channels)
-            channel_keys = [f"Channel {c}" for c in item.channels]
+            channels = item.channels or []
+            channel_keys = [f"Channel {c}" for c in channels]
 
             # Populate or overwrite values directly using channel column names
             item.annotated_channels = {
                 c: row_data[f"Channel {c}"]
-                for c in item.channels
+                for c in channels
                 if f"Channel {c}" in row_data
             }
 
@@ -1102,10 +1118,11 @@ class ExperimentManager:
 
             exclude_cols = base_exclude.union(channel_keys)
 
-            # Assign remaining columns to metadata
+            # Assign remaining columns to metadata (excluding path and channels)
             for col, val in row_data.items():
                 if col not in exclude_cols:
-                    item.annotated_metadata[col] = val
+                    if "Channel" not in col:
+                        item.annotated_metadata[col] = val
 
             self.update_item(item)
 

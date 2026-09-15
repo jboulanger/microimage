@@ -12,6 +12,40 @@ pip install microimage
 uv add microimage
 ```
 
+## Basic usage
+
+```python
+import pandas as pd
+import microimage
+
+exp = microimage.ExperimentManager(
+    data_dir="path to data",
+    results_dir="path to results",
+    db_path="experiment.db",
+)
+exp.scan_data_directory([".czi", ".lsm"])
+exp.export_annotation("annotation.yml")
+
+# Edit the file
+exp.import_annotation("annotation.yml")
+
+
+# Define a processing function
+def process(item, data):
+    """Compute the mean intensity of each channel."""
+    df = pd.DataFrame(
+        {
+            "channel": data.C.values.tolist(),
+            "mean": data.mean(dim=["X", "Y", "Z", "T"]).values,
+        }
+    )
+    return {"measurement": microimage.Table(df)}
+
+
+# Process all files
+microimage.apply(exp, process)
+```
+
 ## Data Organization
 
 ```bash
@@ -54,7 +88,7 @@ Populated during directory scanning. Contains one row per scene (physical positi
 | `scale_t, scale_z, ...` | REAL | Physical scale/calibration values for each dimension. |
 | `channels` | TEXT | JSON list of channel names as extracted from the file. |
 
-> **Note:** The id is computed at scan time from the file name, modification time, and scene index. If a file is renamed or modified and the directory is rescanned, a new ID will be generated, breaking the link to any existing results. Avoid rescanning after files have been processed.
+> **Note:** The id is computed at scan time from the file name, modification time, and scene index. If a file is renamed or modified and the directory is rescanned, a new ID will be generated, breaking the link to any existing results. Avoid rescanning after files have been processed. 
 
 ### `annotation` Table
 
@@ -63,7 +97,7 @@ Populated by importing a user-edited YAML file. Overrides or extends the raw met
 | Column | Type | Description |
 | :--- | :--- | :--- |
 | `data_id` | TEXT | Foreign key referencing `data.id`. |
-| `channels` | TEXT | JSON list of user-defined semantic channel names, overriding those in `data.channels`. |
+| `channels` | TEXT | JSON dictionary of user-defined semantic channel names, mapping those in `data.channels`. |
 | `metadata` | TEXT | JSON string of arbitrary user-defined metadata. |
 
 *Primary key: `(data_id)`.*
@@ -106,12 +140,14 @@ exp.import_annotation("annotation.yml")
 
 # Visualize a scene in a notebook
 item = exp.get_all_items()[0]
-exp.show_image(item,["NUCLEI","MEMBRANE"],["blue","green"])
+exp.show_image(item, ["NUCLEI", "MEMBRANE"], ["blue", "green"])
 exp.show_scalebar()
+
 
 # Define a processing function
 def process(item, data):
     return {"table": Table(), "labels": Contours()}
+
 
 # Run processing in parallel using Dask
 cluster = LocalCluster(n_workers=4, threads_per_worker=1)
@@ -122,7 +158,7 @@ microimage.apply(exp, process, client)
 
 # Inspect results
 item = exp.get_all_items()[0]
-exp.show_image(item,["NUCLEI","MEMBRANE"],["blue","green"])
+exp.show_image(item, ["NUCLEI", "MEMBRANE"], ["blue", "green"])
 exp.show_contours(item)
 exp.show_scalebar()
 ```

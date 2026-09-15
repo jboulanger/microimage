@@ -1,22 +1,20 @@
 set0:
   channels:
-    - red
-    - blue
-    - green
+    Ch1-T3: blue
+    Ch2-T1: red
+    ChS1-T2: green
   files:
-    - 151125_GFP 488_PCNT 555_SunBicD2 FL CC mut new_multiple.lsm
-    - 151125_GFP 488_PCNT 555_SunBicD2 FL Mut1 new_multiple.lsm
-    - 151125_GFP 488_PCNT 555_SunBicD2 FL new_multiple.lsm
+    - N=1/100526_BicD HCR 647_PCNT 488_DAPI_Hela WT_CHX_multiple_1.lsm
+    - N=1/100526_BicD HCR 647_PCNT 488_DAPI_Hela WT_multiple_1.lsm
   metadata:
-    condition: WT
+    run: 1
 set1:
   channels:
-    - red
-    - blue
-    - green
+    Ch1-T3: blue
+    Ch2-T1: red
+    ChS1-T2: green
   files:
-    - 121125_GFP 488_PCNT 647_SunBicD2 FL CC1 new_multiple.lsm
-    - 121125_GFP 488_PCNT 647_SunBicD2 FL Mut1 new_multiple.lsm
-    - 121125_GFP 488_PCNT 647_SunBicD2 FL new_multiple.lsm
+    - N=2/150526_BicD HCR 647_PCNT 488_DAPI_Hela WT_CHX_multiple_1.lsm
+    - N=2/150526_BicD HCR 647_PCNT 488_DAPI_Hela WT_multiple_1.lsm
   metadata:
-    condition: Mutant
+    run: 2
