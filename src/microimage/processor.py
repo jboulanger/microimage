@@ -5,6 +5,7 @@ against DataItem objects, either locally or via a dask.distributed client.
 """
 
 import logging
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -12,14 +13,70 @@ import xarray as xr
 
 from .manager import ExperimentManager
 from .models import DataItem
-from .results import Result
+from .results import Parameters, Result
 
 logger = logging.getLogger(__name__)
 
 
+class Processor(ABC):
+    """Analysis base class for processing DataItems.
+
+    Subclasses implement `process(item, data)` to perform custom
+    analysis on each image and metadata item.
+    """
+
+    def __call__(
+        self, item: DataItem, data: xr.DataArray
+    ) -> Dict[str, Result]:
+        """Process an item and its image data."""
+        return self.process(item, data)
+
+    @abstractmethod
+    def process(
+        self, item: DataItem, data: xr.DataArray
+    ) -> Dict[str, Result]:
+        """Process an item and its image data.
+
+        Returns
+        -------
+        Dict[str, Result]
+            Mapping of result names to microimage Result instances.
+        """
+        ...
+
+    def validate(
+        self, item: DataItem, data: xr.DataArray
+    ) -> Tuple[bool, Optional[str]]:
+        """Validate whether the item and data are suitable for processing.
+
+        Parameters
+        ----------
+        item : DataItem
+            The metadata item to validate.
+        data : xr.DataArray
+            The image data to validate.
+
+        Returns
+        -------
+        Tuple[bool, Optional[str]]
+            A tuple of (is_valid, error_or_skip_message).
+        """
+        return True, None
+
+    def get_parameters(self) -> Optional[Dict[str, Any]]:
+        """Return parameters dictionary for provenance tracking.
+
+        Returns
+        -------
+        Optional[Dict[str, Any]]
+            Parameters dictionary to be saved alongside the results.
+        """
+        return None
+
+
 def _apply_to_item(
     item: Union[DataItem, Tuple[DataItem, xr.DataArray]],
-    processing_fn: Callable[[DataItem, xr.DataArray], Dict[str, Any]],
+    processing_fn: Union[Processor, Callable[[DataItem, xr.DataArray], Dict[str, Any]]],
     data_dir: Path,
     results_dir: Path,
     db_path: Path,
@@ -34,9 +91,9 @@ def _apply_to_item(
     item : Union[DataItem, Tuple[DataItem, xr.DataArray]]
         The item to be processed. Can be a DataItem object or a tuple
         containing a DataItem and its pre-loaded xr.DataArray.
-    processing_fn : Callable[[DataItem, xr.DataArray], Dict[str, Any]]
-        A user-defined function that accepts a DataItem and the loaded image data.
-        It returns a dictionary mapping result types to data objects (e.g., Arrays).
+    processing_fn : Union[Processor, Callable[[DataItem, xr.DataArray], Dict[str, Any]]]
+        A Processor instance or a user-defined function that accepts a DataItem
+        and loaded image data, returning a dictionary mapping result names to Result objects.
     data_dir : Path
         The absolute path to the raw data directory.
     results_dir : Path
@@ -67,18 +124,42 @@ def _apply_to_item(
                 else:
                     data = worker_manager.load_item_data(target_item)
 
-                # 1. Process scenes
+                # 1. Validation hook (if processing_fn provides validate)
+                if hasattr(processing_fn, "validate") and callable(processing_fn.validate):
+                    is_valid, msg = processing_fn.validate(target_item, data)
+                    if not is_valid:
+                        err_msg = f"Validation failed: {msg}" if msg else "Validation failed."
+                        logger.warning(f"Item {item_id} validation failed: {err_msg}")
+                        target_item.processed = False
+                        target_item.error = err_msg
+                        return target_item.id, False, target_item.error
+
+                # 2. Process data
                 results = processing_fn(target_item, data)
 
-                # 2. Store results
-                if results:
-                    for res_name, res_obj in results.items():
-                        if not isinstance(res_obj, Result):
-                            raise TypeError(
-                                f"Result '{res_name}' must be an instance of Result."
-                                f"got {type(res_obj)} instead."
-                            )
-                        worker_manager.save_result(target_item, res_name, res_obj)
+                if results is None:
+                    err_msg = "Processor returned None."
+                    logger.warning(f"Item {item_id}: {err_msg}")
+                    target_item.processed = False
+                    target_item.error = err_msg
+                    return target_item.id, False, target_item.error
+
+                # 3. Parameter provenance hook (if processing_fn provides get_parameters)
+                if hasattr(processing_fn, "get_parameters") and callable(
+                    processing_fn.get_parameters
+                ):
+                    params = processing_fn.get_parameters()
+                    if params and "parameters" not in results:
+                        results["parameters"] = Parameters(params)
+
+                # 4. Store results
+                for res_name, res_obj in results.items():
+                    if not isinstance(res_obj, Result):
+                        raise TypeError(
+                            f"Result '{res_name}' must be an instance of Result, "
+                            f"got {type(res_obj)} instead."
+                        )
+                    worker_manager.save_result(target_item, res_name, res_obj)
 
                 target_item.processed = True
                 target_item.error = None
@@ -101,7 +182,7 @@ def _apply_to_item(
 
 def apply(
     manager: ExperimentManager,
-    processing_fn: Callable[[DataItem, xr.DataArray], Dict[str, Any]],
+    processing_fn: Union[Processor, Callable[[DataItem, xr.DataArray], Dict[str, Any]]],
     client: Optional[Any] = None,
     items: Optional[List[DataItem]] = None,
 ) -> List:
@@ -162,3 +243,18 @@ def apply(
             .map(_apply_to_item, **task_kwargs)
             .compute(scheduler="synchronous")
         )
+
+
+def summarize_run(result: list[tuple[str, bool, str]]):
+    """Summarize the output of running apply in a readable format.
+
+    Parameter
+    ---------
+    result: list[tuple[str,bool,str]
+
+    """
+    nsuccess = sum([elem[1] for elem in result])
+
+    print(f"Pass...{nsuccess}")
+    print(f"Fail...{len(result) - nsuccess}")
+    print(f"Total..{len(result)}")

@@ -1297,7 +1297,8 @@ class ExperimentManager:
             The loaded result wrapped in its specific Result class.
         """
         if result_name not in item.result_files:
-            raise KeyError(f"Result '{result_name}' not found for item {item.id}")
+            return None
+            # raise KeyError(f"Result '{result_name}' not found for item {item.id}")
 
         res_info = item.result_files[result_name]
         logical_type = res_info["type"]

@@ -120,6 +120,22 @@ class YOLOWriter(BaseWriter):
 WRITER_REGISTRY[".txt"] = YOLOWriter
 
 
+class YAMLWriter(BaseWriter):
+    """A writer for YAML files."""
+
+    def write(self, data: Any, **kwargs):
+        """Write data to a YAML file."""
+        import yaml
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w") as f:
+            yaml.dump(data, f, **kwargs)
+
+
+WRITER_REGISTRY[".yml"] = YAMLWriter
+WRITER_REGISTRY[".yaml"] = YAMLWriter
+
+
 class Writer:
     """
     A factory that provides the correct writer.
