@@ -170,7 +170,7 @@ def inspect_data(
     for k in range(len(data.C)):
         plane = np.array(data[0, k].max("Z"))
         plane = plane[::4, ::4].astype(float)
-        a, b = np.percentile(plane, [50, 95])
+        a, b = np.percentile(plane, [30, 99.9])
         plane = np.maximum(0, np.minimum(1, (plane - a) / (b - a)))
         extent = (
             data["X"][0].item(),

@@ -523,6 +523,12 @@ class CZIReader(BaseReader):
             k: v for k, v in full_czi_shape.items() if k not in ["X", "Y"]
         }
 
+        # Ensure spatial dimensions end with Y, X to match image data shape [Y, X]
+        data_array_shape = plane_iteration_dims.copy()
+        data_array_shape["Y"] = full_czi_shape["Y"]
+        data_array_shape["X"] = full_czi_shape["X"]
+        data_array_dims = list(data_array_shape.keys())
+
         # Get the dimension keys and their corresponding ranges of indices for planes
         dim_keys = list(plane_iteration_dims.keys())
         index_ranges = [range(size) for size in plane_iteration_dims.values()]
@@ -542,8 +548,6 @@ class CZIReader(BaseReader):
         scales = {d["@Id"]: float(d["Value"]) for d in distances}
 
         if num_scenes == 0:
-            data_array_shape = full_czi_shape
-            data_array_dims = list(data_array_shape.keys())
             data = da.stack(
                 [
                     da.from_delayed(
